@@ -1,0 +1,44 @@
+# FastAPI & Server
+fastapi
+uvicorn[standard]
+python-multipart
+
+# Database
+sqlalchemy
+psycopg2-binary
+
+# Data Validation
+pydantic
+pydantic-settings
+email-validator
+
+# Authentication
+python-jose[cryptography]
+passlib[bcrypt]
+
+# Environment
+python-dotenv
+
+# LLM
+groq
+
+# Vector Database
+qdrant-client
+
+# Embeddings
+sentence-transformers
+
+# HTTP Requests
+requests
+
+# Scheduling
+apscheduler
+
+# Testing
+pytest
+pytest-asyncio
+httpx
+
+# Code Quality
+black
+isort
