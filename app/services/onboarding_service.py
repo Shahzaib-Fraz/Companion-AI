@@ -429,7 +429,7 @@ class OnboardingService:
                 system=system,
                 user=f"Say this to them now: {note}",
                 temperature=0.6,
-                max_tokens=200,
+                max_tokens=600,
             )
         except LLMError:
             logger.exception("Onboarding phrasing call failed at step %r", step)

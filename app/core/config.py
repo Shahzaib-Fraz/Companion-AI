@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     # LLM (Groq)
     GROQ_API_KEY: str = ""
     GROQ_MODEL: str = "openai/gpt-oss-120b"
+    GROQ_REASONING_EFFORT : str = "low"
     
     # Vector DB (Qdrant)
     QDRANT_URL: str = ""
