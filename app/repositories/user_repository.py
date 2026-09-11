@@ -106,3 +106,11 @@ class UserRepository:
         db.query(UserProfile).filter(UserProfile.user_id == from_user_id).delete()
         db.delete(from_user)
         db.commit()
+
+    @staticmethod
+    def get_by_whatsapp_phone(db: Session, whatsapp_phone: str):
+        """Get user by WhatsApp phone number."""
+        
+# In UserRepository.get_by_whatsapp_phone()
+        return db.query(User).filter(User.phone_number == whatsapp_phone).first()
+                               

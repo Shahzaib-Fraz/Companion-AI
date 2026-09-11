@@ -26,3 +26,10 @@ TestResults.xml
 !.env.example
 .env
 .env.*
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+*.pyd
+.Python

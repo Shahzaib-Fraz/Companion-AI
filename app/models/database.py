@@ -14,6 +14,7 @@ class User(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     password_hash = Column(String(255), nullable=True)
     
+    
     profile = relationship("UserProfile", back_populates="user", uselist=False)
     conversations = relationship("Conversation", back_populates="user")
     messages = relationship("Message", back_populates="user")
@@ -28,6 +29,8 @@ class UserProfile(Base):
     timezone = Column(String, nullable=True)
     language = Column(String, nullable=True)  
     account_tier = Column(String(20), nullable=True)  # free or premium
+    onboarding_step = Column(Integer, default=0, nullable=False)
+    # onboarding_completed = Column(Boolean, default=False, nullable=False)
     onboarding_completed = Column(Boolean, default=False, index=True)
     response_style = Column(String(50), default="normal")
     created_at = Column(DateTime, default=datetime.utcnow)
