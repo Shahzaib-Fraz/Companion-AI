@@ -1,6 +1,7 @@
 """Message data access layer"""
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
+from sqlalchemy.exc import IntegrityError
 from app.models.database import Message, Conversation
 
 class MessageRepository:
@@ -35,14 +36,18 @@ class MessageRepository:
     
     @staticmethod
     def get_or_create_conversation(db: Session, user_id: int, channel: str = "web"):
-        conversation = db.query(Conversation).filter(
-            Conversation.user_id == user_id,
-            Conversation.channel == channel
-        ).first()
-        
-        if not conversation:
+        try:
             conversation = Conversation(user_id=user_id, channel=channel)
             db.add(conversation)
             db.commit()
             db.refresh(conversation)
-        return conversation
+            return conversation
+        except IntegrityError:
+            db.rollback()
+            conversation = db.query(Conversation).filter(
+                Conversation.user_id == user_id,
+                Conversation.channel == channel
+            ).first()
+            if not conversation:
+                raise
+            return conversation

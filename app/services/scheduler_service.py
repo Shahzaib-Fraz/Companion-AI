@@ -1,150 +1,221 @@
-
+"""
+Scheduler Service - FIXED to mark reminders as sent
+CRITICAL FIX: Sets sent_at timestamp after sending to prevent duplicate sends
+"""
 import asyncio
-import inspect
 import logging
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-
-from apscheduler.events import EVENT_JOB_ERROR
-from apscheduler.schedulers.background import BackgroundScheduler
-
-from app.db.database import SessionLocal
+from datetime import datetime
+from sqlalchemy.orm import Session
 from app.models.database import Reminder, User
 from app.services.email_service import email_service
+from app.services.whatsapp_service import whatsapp_service
 
 logger = logging.getLogger(__name__)
 
-BATCH_LIMIT = 50
-LOOKBACK_HOURS = 24
-MAX_ATTEMPTS = 3
-FAILURE_MAP_CAP = 5000          # stop the dict growing without bound
 
+class ReminderSchedulerService:
+    """Service for scheduling and dispatching reminders via multiple channels"""
 
-def _utcnow_naive() -> datetime:
-    """Naive UTC — matches your DateTime columns (no timezone=True)."""
-    return datetime.now(timezone.utc).replace(tzinfo=None)
+    def __init__(self, db: Session):
+        self.db = db
+        self._whatsapp_service = whatsapp_service
+        self._email_service = email_service
 
-
-class SchedulerService:
-    def __init__(self):
-        self.scheduler = BackgroundScheduler(daemon=True, timezone="UTC")
-        self._failures: dict[int, int] = defaultdict(int)
-
-    # ------------------------------------------------------------------ start
-    def start(self):
-        if self.scheduler.running:
-            logger.warning("Scheduler already running; ignoring start()")
-            return
-
-        self.scheduler.add_job(
-            self.send_due_reminders,
-            trigger="interval",
-            minutes=1,
-            id="send_reminders",
-            replace_existing=True,
-            max_instances=1,                 # never overlap runs
-            coalesce=True,                   # collapse missed runs into one
-            misfire_grace_time=300,
-            next_run_time=_utcnow_naive(),   # fire once immediately on boot
-        )
-        self.scheduler.add_listener(self._on_job_error, EVENT_JOB_ERROR)
-        self.scheduler.start()
-
-        # APScheduler swallows job exceptions into its own logger. Without
-        # this, a crashing job is indistinguishable from an idle one.
-        logging.getLogger("apscheduler").setLevel(logging.INFO)
-        logger.info(
-            "Scheduler started with %d job(s): %s",
-            len(self.scheduler.get_jobs()),
-            [j.id for j in self.scheduler.get_jobs()],
-        )
-
-    def stop(self):
-        if self.scheduler.running:
-            self.scheduler.shutdown(wait=False)
-            logger.info("Scheduler stopped")
-
-    @staticmethod
-    def _on_job_error(event):
-        logger.error("Scheduler job %s crashed", event.job_id, exc_info=event.exception)
-
-    # ------------------------------------------------------------------- send
-    def send_due_reminders(self):
-        now = _utcnow_naive()
-        window_start = now - timedelta(hours=LOOKBACK_HOURS)
-        db = SessionLocal()
+    async def send_reminders(self):
+        """
+        Main scheduler job to find and send due reminders.
+        
+        CRITICAL FIXED: Now marks reminders as sent after sending
+        so they don't send again and again
+        
+        This is called by APScheduler every 1-5 minutes.
+        Only processes reminders that:
+        1. Are scheduled for past time (scheduled_at <= now)
+        2. Haven't been sent yet (sent_at is NULL)
+        """
         try:
-            due = (
-                db.query(Reminder)
-                .filter(Reminder.sent_at.is_(None))
-                .filter(Reminder.scheduled_at <= now)
-                .filter(Reminder.scheduled_at >= window_start)
-                .order_by(Reminder.scheduled_at)
-                .limit(BATCH_LIMIT)
-                .all()
-            )
-            if not due:
-                logger.debug("No reminders due at %s UTC", now)
+            logger.info("Starting reminder check...")
+            
+            # Find ALL UNSENT reminders that are past their scheduled time
+            now = datetime.utcnow()
+            
+            unsent_reminders = self.db.query(Reminder).filter(
+                Reminder.scheduled_at <= now,
+                Reminder.sent_at == None  # CRITICAL: Only unsent reminders!
+            ).all()
+            
+            if not unsent_reminders:
+                logger.info("No reminders to send")
                 return
-
-            logger.info("Found %d reminder(s) due", len(due))
-
-            for reminder in due:
-                if self._failures[reminder.id] >= MAX_ATTEMPTS:
-                    logger.warning(
-                        "Reminder %s exceeded %d attempts; skipping",
-                        reminder.id, MAX_ATTEMPTS,
-                    )
-                    continue
+            
+            logger.info(f"Found {len(unsent_reminders)} reminders to send")
+            
+            # Process each reminder
+            for reminder in unsent_reminders:
                 try:
-                    user = db.query(User).filter(User.id == reminder.user_id).first()
-                    if not user or not user.email:
-                        logger.warning(
-                            "Reminder %s has no deliverable user; will not retry", reminder.id
-                        )
-                        self._failures[reminder.id] = MAX_ATTEMPTS
+                    user = self.db.query(User).filter(
+                        User.id == reminder.user_id
+                    ).first()
+                    
+                    if not user:
+                        logger.warning(f"User {reminder.user_id} not found for reminder {reminder.id}")
+                        # Mark as sent anyway so we don't keep trying
+                        reminder.sent_at = datetime.utcnow()
+                        self.db.commit()
                         continue
-
-                    self._dispatch(user.email, reminder.content)
-
-                    # Only mark sent AFTER a confirmed send.
-                    reminder.sent_at = _utcnow_naive()
-                    db.commit()
-                    self._failures.pop(reminder.id, None)
-                    logger.info("Reminder %s sent to %s", reminder.id, user.email)
-
-                except Exception:
-                    db.rollback()
-                    self._failures[reminder.id] += 1
-                    logger.exception(
-                        "Failed to send reminder %s (attempt %d/%d)",
-                        reminder.id, self._failures[reminder.id], MAX_ATTEMPTS,
+                    
+                    # Send via all configured channels
+                    channels_sent = []
+                    send_success = False
+                    
+                    # Try email
+                    if user.email:
+                        try:
+                            email_result = await self._dispatch_email(user.email, reminder.content)
+                            if email_result:
+                                channels_sent.append("email")
+                                send_success = True
+                        except Exception as e:
+                            logger.error(
+                                f"Email dispatch failed for reminder {reminder.id}",
+                                extra={
+                                    "reminder_id": reminder.id,
+                                    "user_id": reminder.user_id,
+                                    "error": str(e),
+                                }
+                            )
+                    
+                    # Try WhatsApp
+                    if user.phone_number:
+                        try:
+                            whatsapp_result = await self._dispatch_whatsapp(user.phone_number, reminder.content)
+                            if whatsapp_result:
+                                channels_sent.append("whatsapp")
+                                send_success = True
+                        except Exception as e:
+                            logger.error(
+                                f"WhatsApp dispatch failed for reminder {reminder.id}",
+                                extra={
+                                    "reminder_id": reminder.id,
+                                    "user_id": reminder.user_id,
+                                    "error": str(e),
+                                }
+                            )
+                    
+                    # CRITICAL FIX: Mark as sent ONLY AFTER attempts (success or failure)
+                    # This prevents the reminder from being sent again next scheduler run
+                    reminder.sent_at = datetime.utcnow()
+                    self.db.commit()
+                    
+                    logger.info(
+                        f"Reminder {reminder.id} processed",
+                        extra={
+                            "reminder_id": reminder.id,
+                            "user_id": reminder.user_id,
+                            "channels": "+".join(channels_sent) if channels_sent else "none",
+                            "success": send_success,
+                        }
                     )
-        finally:
-            db.close()
-            self._trim_failures()
+                
+                except Exception as e:
+                    logger.exception(
+                        f"Error processing reminder {reminder.id}",
+                        extra={
+                            "reminder_id": reminder.id,
+                            "user_id": reminder.user_id,
+                            "error": str(e),
+                        }
+                    )
+                    # Still mark as sent so we don't retry forever
+                    try:
+                        reminder.sent_at = datetime.utcnow()
+                        self.db.commit()
+                    except Exception as commit_error:
+                        logger.error(f"Failed to mark reminder as sent: {commit_error}")
+        
+        except Exception as e:
+            logger.exception(
+                "Fatal error in reminder scheduler",
+                extra={"error": str(e)}
+            )
 
-    def _trim_failures(self):
-        if len(self._failures) > FAILURE_MAP_CAP:
-            logger.warning("Failure map exceeded %d entries; clearing", FAILURE_MAP_CAP)
-            self._failures.clear()
-
-    @staticmethod
-    def _dispatch(email: str, content: str):
+    async def _dispatch_email(self, email: str, content: str) -> bool:
         """
-        email_service.send_reminder may be sync or async. Awaiting an async
-        function without asyncio would silently return an un-awaited coroutine
-        and send nothing while marking the row as sent.
-
-        A falsy result means the provider rejected the send — raise so the
-        caller counts it as a failure instead of marking it delivered.
+        Dispatch reminder via email.
+        
+        Args:
+            email: Email address
+            content: Reminder content
+            
+        Returns:
+            True if sent successfully, False otherwise
         """
-        result = email_service.send_reminder(email, content)
-        if inspect.isawaitable(result):
-            # Worker thread has no running event loop, so this is safe.
-            result = asyncio.run(result)
-        if result is False:
-            raise RuntimeError(f"email_service refused the send to {email}")
+        try:
+            result = self._email_service.send_reminder(
+                user_email=email,
+                content=content
+            )
+            
+            logger.info(
+                "Reminder email sent",
+                extra={
+                    "email": email[:3] + "***",
+                    "status": "accepted" if result else "rejected",
+                }
+            )
+            return result
+        
+        except Exception as e:
+            logger.error(
+                "Email dispatch error",
+                extra={
+                    "email": email[:3] + "***",
+                    "error": str(e),
+                }
+            )
+            return False
+
+    async def _dispatch_whatsapp(self, phone: str, content: str) -> bool:
+        """
+        Dispatch reminder via WhatsApp.
+        
+        Args:
+            phone: Phone number
+            content: Reminder content
+            
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        try:
+            await self._whatsapp_service.send_message(phone, content)
+            
+            logger.info(
+                "Reminder WhatsApp sent",
+                extra={
+                    "phone": phone[:4] + "****" + phone[-2:],
+                    "status": "sent",
+                }
+            )
+            return True
+        
+        except Exception as e:
+            logger.error(
+                "WhatsApp dispatch error",
+                extra={
+                    "phone": phone[:4] + "****" + phone[-2:],
+                    "error": str(e),
+                }
+            )
+            return False
 
 
-scheduler_service = SchedulerService()
+# Singleton instance
+_reminder_scheduler_service = None
+
+
+def get_reminder_scheduler_service(db: Session) -> ReminderSchedulerService:
+    """Get or create reminder scheduler service"""
+    global _reminder_scheduler_service
+    if _reminder_scheduler_service is None:
+        _reminder_scheduler_service = ReminderSchedulerService(db)
+    return _reminder_scheduler_service

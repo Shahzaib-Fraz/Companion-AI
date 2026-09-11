@@ -102,6 +102,93 @@ class ReminderService:
             "local_time": self._format(when_local),
         }
 
+    # ADD THIS METHOD to your ReminderService class in app/services/reminder_service.py
+# Place it AFTER the maybe_create() method
+
+    async def maybe_create_from_scheduled_at(  
+    self,
+    db: Session,
+    user_id: int,
+    content: str,
+    scheduled_at_local: datetime,
+    user_timezone: str = "UTC",
+) -> Optional[Dict[str, Any]]:
+        """
+        NEW METHOD: For API endpoint use.
+        Creates reminder from a pre-parsed datetime with timezone.
+        Ensures API reminders follow the same timezone logic as chat reminders.
+        Fixes issue #4 (inconsistent timezone handling).
+        """
+        if not (content or "").strip():
+            return None
+        
+        content = str(content).strip()[:MAX_CONTENT]
+        if len(content) < 2:
+            return {
+                "status": "error",
+                "error": "Content too short"
+            }
+        
+        if not scheduled_at_local.tzinfo:
+            return {
+                "status": "error",
+                "error": "scheduled_at must include timezone info"
+            }
+        
+        tz = self._safe_tz(user_timezone)
+        now_local = datetime.now(tz)
+        
+        if scheduled_at_local <= now_local:
+            return {
+                "status": "error",
+                "error": "Cannot schedule in the past"
+            }
+        
+        # Convert to naive UTC (same logic as chat reminders)
+        when_utc = scheduled_at_local.astimezone(timezone.utc).replace(tzinfo=None)
+        
+        # Check for duplicates
+        existing = (
+            db.query(Reminder)
+            .filter(
+                Reminder.user_id == user_id,
+                Reminder.content == content,
+                Reminder.scheduled_at == when_utc,
+                Reminder.sent_at.is_(None),
+            )
+            .first()
+        )
+        if existing:
+            logger.info("Duplicate reminder ignored for user %s: %r", user_id, content)
+            return {
+                "status": "created",
+                "reminder": existing,
+                "local_time": self._format(scheduled_at_local),
+            }
+        
+        # Create new reminder
+        reminder = Reminder(
+            user_id=user_id,
+            content=content,
+            scheduled_at=when_utc,
+            attempt_count=0,
+            last_attempt_at=None,
+            last_failure_reason=None,
+        )
+        db.add(reminder)
+        db.commit()
+        db.refresh(reminder)
+        
+        logger.info(
+            "Reminder %s created for user %s at %s UTC (%s local)",
+            reminder.id, user_id, when_utc, scheduled_at_local,
+        )
+        return {
+            "status": "created",
+            "reminder": reminder,
+            "local_time": self._format(scheduled_at_local),
+        }
+
     # ------------------------------------------------------------- extraction
     @staticmethod
     def _instruction(now_local: datetime, tz: ZoneInfo) -> str:

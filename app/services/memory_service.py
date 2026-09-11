@@ -1,3 +1,7 @@
+"""
+Memory Service - Issue #29 Fixed
+Proper exception handling for index creation
+"""
 
 import asyncio
 import logging
@@ -6,6 +10,7 @@ from typing import List, Optional
 
 from app.core.config import settings
 from app.services.embedding_service import DIMENSION
+from app.services.dependency_health import dependency_health
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +33,7 @@ class MemoryService:
             )
         except Exception:
             logger.exception("Qdrant client could not be created; premium memory disabled")
+            dependency_health.set_status("qdrant", "down", "Client initialization failed")
 
     # ------------------------------------------------------------- bootstrap
     def _ensure_collection(self):
@@ -45,6 +51,7 @@ class MemoryService:
                 exists = self.collection_name in names
         except Exception:
             logger.exception("Could not list Qdrant collections")
+            dependency_health.set_status("qdrant", "down", "Failed to list collections")
 
         if not exists:
             self.client.create_collection(
@@ -64,10 +71,16 @@ class MemoryService:
         # indexes the points already stored.
         self._ensure_user_id_index()
 
+        dependency_health.set_status("qdrant", "up")
         self._ready = True
 
     def _ensure_user_id_index(self):
-        """Idempotent: creating an index that already exists is a no-op."""
+        """
+        Idempotent: creating an index that already exists is a no-op.
+        
+        ✅ FIXED #29: Properly distinguish between "already exists" (OK)
+        and real errors (Connection refused, Auth failed, etc.)
+        """
         from qdrant_client.models import PayloadSchemaType
 
         for kwargs in (
@@ -81,13 +94,25 @@ class MemoryService:
                     field_schema=PayloadSchemaType.INTEGER,
                     **kwargs,
                 )
-                logger.info("Payload index on user_id is in place")
+                logger.info("✅ Payload index on user_id created successfully")
+                dependency_health.set_status("qdrant", "up")
                 return
             except TypeError:
                 continue      # unsupported kwarg, try the simpler call
             except Exception as exc:
-                # Most commonly "already exists", which is success.
-                logger.info("create_payload_index(user_id): %s", exc)
+                error_str = str(exc).lower()
+                
+                # ✅ FIXED #29: Only suppress "already exists" errors
+                # Check if error message contains both "already" AND "exists"
+                if "already" in error_str and "exists" in error_str:
+                    logger.info("✅ Payload index on user_id already exists (OK)")
+                    dependency_health.set_status("qdrant", "up")
+                    return
+                
+                # ❌ Any other error is a REAL FAILURE, not just idempotency
+                error_msg = f"{type(exc).__name__}: {str(exc)}"
+                dependency_health.set_status("qdrant", "down", error_msg)
+                logger.error(f"❌ Failed to create/verify user_id index: {error_msg}")
                 return
 
     @staticmethod
@@ -105,6 +130,8 @@ class MemoryService:
             payload={"user_id": user_id, "content": content},
         )
         self.client.upsert(collection_name=self.collection_name, points=[point])
+        
+        dependency_health.set_status("qdrant", "up")
         return True
 
     async def store_memory(self, user_id: int, content: str, vector: Optional[List[float]]) -> bool:
@@ -117,9 +144,14 @@ class MemoryService:
             )
             return False
         try:
-            return await asyncio.to_thread(self._store_sync, user_id, content, vector)
-        except Exception:
-            logger.exception("Qdrant upsert failed for user %s", user_id)
+            result = await asyncio.to_thread(self._store_sync, user_id, content, vector)
+            if result:
+                dependency_health.set_status("qdrant", "up")
+            return result
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            dependency_health.set_status("qdrant", "down", error_msg)
+            logger.error(f"❌ Qdrant upsert failed for user {user_id}: {error_msg}")
             return False
 
     # ------------------------------------------------------------------- read
@@ -129,40 +161,70 @@ class MemoryService:
         self._ensure_collection()
         flt = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
 
-        query = getattr(self.client, "query_points", None)
-        if callable(query):
-            result = query(
-                collection_name=self.collection_name,
-                query=vector,
-                query_filter=flt,
-                limit=top_k,
-                with_payload=True,
-            )
-            points = getattr(result, "points", result)
-        else:                                    # older qdrant-client
-            points = self.client.search(
-                collection_name=self.collection_name,
-                query_vector=vector,
-                query_filter=flt,
-                limit=top_k,
-                with_payload=True,
+        # ✅ FIXED Issue #23: Apply similarity threshold from config
+        threshold = settings.MEMORY_SIMILARITY_THRESHOLD
+
+        try:
+            query = getattr(self.client, "query_points", None)
+            if callable(query):
+                result = query(
+                    collection_name=self.collection_name,
+                    query=vector,
+                    query_filter=flt,
+                    limit=top_k,
+                    score_threshold=threshold,  # ✅ Only retrieve >= threshold
+                    with_payload=True,
+                )
+                points = getattr(result, "points", result)
+            else:                                    # older qdrant-client
+                points = self.client.search(
+                    collection_name=self.collection_name,
+                    query_vector=vector,
+                    query_filter=flt,
+                    limit=top_k,
+                    score_threshold=threshold,  # ✅ Only retrieve >= threshold
+                    with_payload=True,
+                )
+
+            out = []
+            for p in points or []:
+                payload = getattr(p, "payload", None) or {}
+                content = payload.get("content")
+                if content:
+                    out.append(content)
+
+            dependency_health.set_status("qdrant", "up")
+
+            logger.info(
+                f"🔍 Memory search retrieved {len(out)} results",
+                extra={"user_id": user_id, "threshold": threshold, "requested": top_k}
             )
 
-        out = []
-        for p in points or []:
-            payload = getattr(p, "payload", None) or {}
-            content = payload.get("content")
-            if content:
-                out.append(content)
-        return out
+            return out
+        
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            dependency_health.set_status("qdrant", "down", error_msg)
+            logger.error(f"❌ Qdrant search failed for user {user_id}: {error_msg}")
+            return []
 
     async def search(self, user_id: int, vector: Optional[List[float]], top_k: int = 5) -> List[str]:
         if not self.client or not vector:
             return []
+        
+        if dependency_health.get_status("qdrant") == "down":
+            logger.warning(
+                f"⚠️  Qdrant is down, memory unavailable",
+                extra={"user_id": user_id}
+            )
+            return []
+        
         try:
             return await asyncio.to_thread(self._search_sync, user_id, vector, top_k)
-        except Exception:
-            logger.exception("Qdrant search failed for user %s", user_id)
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            dependency_health.set_status("qdrant", "down", error_msg)
+            logger.error(f"❌ Qdrant search failed for user {user_id}: {error_msg}")
             return []
 
 

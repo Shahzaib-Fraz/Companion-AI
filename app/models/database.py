@@ -12,6 +12,7 @@ class User(Base):
     phone_number = Column(String(20), unique=True, index=True, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    password_hash = Column(String(255), nullable=True)
     
     profile = relationship("UserProfile", back_populates="user", uselist=False)
     conversations = relationship("Conversation", back_populates="user")
@@ -57,6 +58,12 @@ class Message(Base):
     content = Column(Text, nullable=False)
     channel = Column(String(20))  # web or whatsapp
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    external_message_id = Column(
+        String(255),
+        unique=True,
+        index=True,
+        nullable=True
+    )
     
     conversation = relationship("Conversation", back_populates="messages")
     user = relationship("User", back_populates="messages")
@@ -70,6 +77,10 @@ class Reminder(Base):
     scheduled_at = Column(DateTime, index=True, nullable=False)
     sent_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    attempt_count = Column(Integer, default=0, nullable=False)
+    last_attempt_at = Column(DateTime, nullable=True)
+    last_failure_reason = Column(Text, nullable=True)
     
     user = relationship("User", back_populates="reminders")
 
