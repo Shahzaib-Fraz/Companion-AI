@@ -1,5 +1,5 @@
 """
-Scheduler Service - FIXED to mark reminders as sent
+Scheduler Service - FIXED to work with your actual structure
 PLUS: Message Summarization (every 6 hours)
 Combines reminder dispatch + conversation summaries in one scheduler
 """
@@ -219,13 +219,13 @@ class ReminderSchedulerService:
 
     async def _generate_message_summaries(self):
         """
-        ✅ NEW: Generate summaries for all active users
-        (Moved from separate background_tasks.py)
+        ✅ NEW: Generate summaries for ALL users
+        ✅ FIXED: Removed is_active filter (User model doesn't have it)
         """
         try:
-            # Get all active users
-            users = self.db.query(User).filter(User.is_active == True).all()
-            logger.info(f"📋 Processing {len(users)} active users for summarization")
+            # ✅ FIX: Get ALL users (no is_active filter)
+            users = self.db.query(User).all()
+            logger.info(f"📋 Processing {len(users)} users for summarization")
             
             success_count = 0
             error_count = 0
@@ -309,8 +309,9 @@ class ReminderSchedulerService:
                 return
             
             # Step 6: Premium users - extract preferences
-            if (user.profile.account_tier or "").strip() == "premium":
-                await self._extract_and_store_preferences(user_id, msg_dicts)
+            if hasattr(user, 'profile') and hasattr(user.profile, 'account_tier'):
+                if (user.profile.account_tier or "").strip() == "premium":
+                    await self._extract_and_store_preferences(user_id, msg_dicts)
         
         except Exception as e:
             logger.error(
