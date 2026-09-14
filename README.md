@@ -189,7 +189,7 @@ BREVO_API_KEY=your_key
 BREVO_SENDER_EMAIL=noreply@example.com
 
 # WhatsApp
-WHATSAPP_API_URL=https://graph.instagram.com/v18.0
+WHATSAPP_API_URL=https://graph.facebook.com/v18.0
 WHATSAPP_BUSINESS_ACCOUNT_ID=your_id
 WHATSAPP_ACCESS_TOKEN=your_token
 WHATSAPP_VERIFY_TOKEN=your_token
