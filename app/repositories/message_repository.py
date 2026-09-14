@@ -35,6 +35,14 @@ class MessageRepository:
         return messages[::-1]
     
     @staticmethod
+    def get_last_500(db: Session, user_id: int):
+        """✅ NEW: Get last 500 messages for summarization"""
+        messages = db.query(Message).filter(
+            Message.user_id == user_id
+        ).order_by(desc(Message.created_at)).limit(500).all()
+        return messages[::-1]  # Oldest → newest
+
+    @staticmethod
     def get_or_create_conversation(db: Session, user_id: int, channel: str = "web"):
         try:
             conversation = Conversation(user_id=user_id, channel=channel)

@@ -121,6 +121,55 @@ class WhatsAppService:
         except Exception as e:
             logger.error(f"❌ WhatsApp send error: {str(e)}")
             return False
+
+    async def send_reminder(
+        self,
+        phone_number: str,
+        content: str,
+        user_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Send a reminder over WhatsApp, formatted so it reads like an actual
+        reminder notification instead of a raw echo of the stored content.
+
+        FIXED (Issue #42: Reminders looked like a bare echo of the user's
+        request instead of a real notification): scheduler code that used to
+        call send_message(phone, reminder.content) directly should call this
+        instead. send_message() is unchanged and still available for
+        non-reminder messages.
+
+        Args:
+            phone_number: Recipient phone number
+            content: The short imperative reminder text (e.g. "Go for a walk")
+            user_name: Optional display name for a personalised greeting
+
+        Returns:
+            True if successful, False otherwise
+        """
+        text = self._format_reminder_text(content, user_name)
+        return await self.send_message(phone_number, text)
+
+    @staticmethod
+    def _format_reminder_text(content: str, user_name: Optional[str] = None) -> str:
+        """Turn a bare reminder content string into a natural WhatsApp message."""
+        content = (content or "").strip().rstrip(". ")
+        if not content:
+            content = "your reminder"
+
+        first_name = (user_name or "").strip().split(" ")[0] if user_name else ""
+        greeting = f"Hey {first_name}!" if first_name else "Hey!"
+        lower_content = content[0].lower() + content[1:] if len(content) > 1 else content.lower()
+
+        templates = [
+            f"⏰ *Reminder*\n\n{greeting} Just a heads-up — {content}.",
+            f"⏰ *Reminder*\n\n{greeting} Don't forget: {content}.",
+            f"⏰ *Reminder*\n\n{greeting} Time to {lower_content}! 🙂",
+        ]
+
+        # Deterministic pick (by content, not random) so retries of the same
+        # reminder produce the same text, but different reminders still vary.
+        idx = sum(map(ord, content)) % len(templates)
+        return templates[idx]
     
     def parse_webhook_message(self, body: dict) -> Optional[dict]:
         """

@@ -1,6 +1,6 @@
 """
-Memory Service - Issue #29 Fixed
-Proper exception handling for index creation
+Memory Service - Issue #29 Fixed + Incremental Summary Support
+Proper exception handling for index creation + type-aware retrieval
 """
 
 import asyncio
@@ -62,14 +62,9 @@ class MemoryService:
                 "Created Qdrant collection %s (dim=%d)", self.collection_name, self.dimension
             )
 
-        # REQUIRED, not optional. Qdrant Cloud runs in strict mode, which
-        # refuses to filter on an unindexed payload field:
-        #   400 Bad request: Index required but not found for "user_id"
-        # Upserts do not filter, so without this writes succeed and only
-        # retrieval fails - premium memory looks like it works and silently
-        # never recalls anything. Runs for existing collections too; Qdrant
-        # indexes the points already stored.
+        # REQUIRED, not optional. Qdrant Cloud runs in strict mode
         self._ensure_user_id_index()
+        self._ensure_type_index()
 
         dependency_health.set_status("qdrant", "up")
         self._ready = True
@@ -103,16 +98,48 @@ class MemoryService:
                 error_str = str(exc).lower()
                 
                 # ✅ FIXED #29: Only suppress "already exists" errors
-                # Check if error message contains both "already" AND "exists"
                 if "already" in error_str and "exists" in error_str:
                     logger.info("✅ Payload index on user_id already exists (OK)")
                     dependency_health.set_status("qdrant", "up")
                     return
                 
-                # ❌ Any other error is a REAL FAILURE, not just idempotency
+                # ❌ Any other error is a REAL FAILURE
                 error_msg = f"{type(exc).__name__}: {str(exc)}"
                 dependency_health.set_status("qdrant", "down", error_msg)
                 logger.error(f"❌ Failed to create/verify user_id index: {error_msg}")
+                return
+
+    def _ensure_type_index(self):
+        """
+        Create index on 'type' field for filtering by memory type.
+        Idempotent like user_id index.
+        """
+        from qdrant_client.models import PayloadSchemaType
+
+        for kwargs in (
+            {"wait": True},
+            {},
+        ):
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name="type",
+                    field_schema=PayloadSchemaType.KEYWORD,
+                    **kwargs,
+                )
+                logger.info("✅ Payload index on type created successfully")
+                return
+            except TypeError:
+                continue
+            except Exception as exc:
+                error_str = str(exc).lower()
+                
+                if "already" in error_str and "exists" in error_str:
+                    logger.info("✅ Payload index on type already exists (OK)")
+                    return
+                
+                error_msg = f"{type(exc).__name__}: {str(exc)}"
+                logger.error(f"❌ Failed to create/verify type index: {error_msg}")
                 return
 
     @staticmethod
@@ -120,21 +147,38 @@ class MemoryService:
         return str(uuid.uuid5(_NAMESPACE, f"{user_id}::{content}"))
 
     # ------------------------------------------------------------------ write
-    def _store_sync(self, user_id: int, content: str, vector: List[float]) -> bool:
+    def _store_sync(
+        self, 
+        user_id: int, 
+        content: str, 
+        vector: List[float],
+        memory_type: str = "user_note"
+    ) -> bool:
         from qdrant_client.models import PointStruct
 
         self._ensure_collection()
         point = PointStruct(
             id=self._point_id(user_id, content),
             vector=vector,
-            payload={"user_id": user_id, "content": content},
+            payload={
+                "user_id": user_id,
+                "content": content,
+                "type": memory_type,  # ✅ NEW: "summary" | "preference" | "user_note"
+            },
         )
         self.client.upsert(collection_name=self.collection_name, points=[point])
         
         dependency_health.set_status("qdrant", "up")
         return True
 
-    async def store_memory(self, user_id: int, content: str, vector: Optional[List[float]]) -> bool:
+    async def store_memory(
+        self, 
+        user_id: int, 
+        content: str, 
+        vector: Optional[List[float]],
+        memory_type: str = "user_note"
+    ) -> bool:
+        """Store a memory with type classification"""
         if not self.client or not vector or not (content or "").strip():
             return False
         if len(vector) != self.dimension:
@@ -144,7 +188,9 @@ class MemoryService:
             )
             return False
         try:
-            result = await asyncio.to_thread(self._store_sync, user_id, content, vector)
+            result = await asyncio.to_thread(
+                self._store_sync, user_id, content, vector, memory_type
+            )
             if result:
                 dependency_health.set_status("qdrant", "up")
             return result
@@ -154,14 +200,43 @@ class MemoryService:
             logger.error(f"❌ Qdrant upsert failed for user {user_id}: {error_msg}")
             return False
 
+    async def store_summary(
+        self, 
+        user_id: int, 
+        summary_text: str, 
+        vector: List[float]
+    ) -> bool:
+        """Store rolling conversation summary (replaces previous)"""
+        return await self.store_memory(user_id, summary_text, vector, memory_type="summary")
+
+    async def store_preference(
+        self, 
+        user_id: int, 
+        pref_text: str, 
+        vector: List[float]
+    ) -> bool:
+        """Store user preference (premium only)"""
+        return await self.store_memory(user_id, pref_text, vector, memory_type="preference")
+
     # ------------------------------------------------------------------- read
-    def _search_sync(self, user_id: int, vector: List[float], top_k: int) -> List[str]:
+    def _search_sync(
+        self, 
+        user_id: int, 
+        vector: List[float], 
+        top_k: int,
+        memory_type: Optional[str] = None
+    ) -> List[str]:
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         self._ensure_collection()
-        flt = Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))])
-
-        # ✅ FIXED Issue #23: Apply similarity threshold from config
+        
+        # ✅ Build filter: user_id (required) + type (optional)
+        conditions = [FieldCondition(key="user_id", match=MatchValue(value=user_id))]
+        
+        if memory_type:
+            conditions.append(FieldCondition(key="type", match=MatchValue(value=memory_type)))
+        
+        flt = Filter(must=conditions)
         threshold = settings.MEMORY_SIMILARITY_THRESHOLD
 
         try:
@@ -172,17 +247,17 @@ class MemoryService:
                     query=vector,
                     query_filter=flt,
                     limit=top_k,
-                    score_threshold=threshold,  # ✅ Only retrieve >= threshold
+                    score_threshold=threshold,
                     with_payload=True,
                 )
                 points = getattr(result, "points", result)
-            else:                                    # older qdrant-client
+            else:
                 points = self.client.search(
                     collection_name=self.collection_name,
                     query_vector=vector,
                     query_filter=flt,
                     limit=top_k,
-                    score_threshold=threshold,  # ✅ Only retrieve >= threshold
+                    score_threshold=threshold,
                     with_payload=True,
                 )
 
@@ -197,7 +272,12 @@ class MemoryService:
 
             logger.info(
                 f"🔍 Memory search retrieved {len(out)} results",
-                extra={"user_id": user_id, "threshold": threshold, "requested": top_k}
+                extra={
+                    "user_id": user_id, 
+                    "type": memory_type or "all",
+                    "threshold": threshold, 
+                    "requested": top_k
+                }
             )
 
             return out
@@ -208,7 +288,17 @@ class MemoryService:
             logger.error(f"❌ Qdrant search failed for user {user_id}: {error_msg}")
             return []
 
-    async def search(self, user_id: int, vector: Optional[List[float]], top_k: int = 5) -> List[str]:
+    async def search(
+        self, 
+        user_id: int, 
+        vector: Optional[List[float]], 
+        top_k: int = 5,
+        memory_type: Optional[str] = None
+    ) -> List[str]:
+        """
+        Search memories by similarity.
+        memory_type: None (all), "summary", "preference", "user_note"
+        """
         if not self.client or not vector:
             return []
         
@@ -220,12 +310,87 @@ class MemoryService:
             return []
         
         try:
-            return await asyncio.to_thread(self._search_sync, user_id, vector, top_k)
+            return await asyncio.to_thread(
+                self._search_sync, user_id, vector, top_k, memory_type
+            )
         except Exception as e:
             error_msg = f"{type(e).__name__}: {str(e)}"
             dependency_health.set_status("qdrant", "down", error_msg)
-            logger.error(f"❌ Qdrant search failed for user {user_id}: {error_msg}")
+            logger.error(f"❌ Memory search failed for user {user_id}: {error_msg}")
             return []
+
+    def _get_latest_sync(self, user_id: int, memory_type: str) -> Optional[str]:
+        """Get single most recent memory of a specific type"""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        
+        self._ensure_collection()
+        
+        conditions = [
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(key="type", match=MatchValue(value=memory_type))
+        ]
+        flt = Filter(must=conditions)
+        
+        try:
+            query = getattr(self.client, "query_points", None)
+            if callable(query):
+                result = query(
+                    collection_name=self.collection_name,
+                    query_filter=flt,
+                    limit=1,
+                    with_payload=True,
+                )
+                points = getattr(result, "points", result)
+            else:
+                points = self.client.search(
+                    collection_name=self.collection_name,
+                    query_filter=flt,
+                    limit=1,
+                    with_payload=True,
+                )
+            
+            if points:
+                payload = getattr(points[0], "payload", None) or {}
+                content = payload.get("content")
+                if content:
+                    logger.info(
+                        f"✅ Retrieved latest {memory_type}",
+                        extra={"user_id": user_id}
+                    )
+                    return content
+            
+            logger.info(
+                f"⚠️  No {memory_type} found",
+                extra={"user_id": user_id}
+            )
+            return None
+        
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"❌ Failed to fetch latest {memory_type}: {error_msg}")
+            return None
+
+    async def get_latest_by_type(
+        self, 
+        user_id: int, 
+        memory_type: str
+    ) -> Optional[str]:
+        """
+        Fetch the most recent memory of a specific type.
+        Used to get previous summary before generating new one.
+        """
+        if not self.client:
+            return None
+        
+        try:
+            return await asyncio.to_thread(
+                self._get_latest_sync, user_id, memory_type
+            )
+        except Exception as e:
+            logger.warning(
+                f"Could not fetch previous {memory_type} for user {user_id}: {e}"
+            )
+            return None
 
 
 memory_service = MemoryService()

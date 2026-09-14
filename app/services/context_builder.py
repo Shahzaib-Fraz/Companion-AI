@@ -13,7 +13,7 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-HISTORY_LIMIT = 10
+HISTORY_LIMIT = 300
 MEMORY_TOP_K = 5
 
 
@@ -147,37 +147,46 @@ class ContextBuilder:
 
     @staticmethod
     async def _memories(profile, user_id: int, current_message: str) -> List[str]:
-        if (profile.account_tier or "") != "premium":
+        """
+        ✅ NEW: Retrieve conversation summary (free + premium) 
+        + preferences (premium only)
+        """
+        if not profile:
             return []
+        
         try:
             vector = await embedding_service.embed(current_message)
             if not vector:
                 return []
 
-            # ✅ FIXED Issue #23: Apply similarity threshold from config
-            raw_memories = await memory_service.search(user_id, vector, top_k=MEMORY_TOP_K)
+            result = []
             
-            if not raw_memories:
-                return []
-
-            # ✅ FIXED Issue #24: Sanitize suspicious memories
-            safe_memories = []
-            for mem in raw_memories:
-                if not ContextBuilder._is_suspicious(mem):
-                    safe_memories.append(mem)
-                else:
-                    logger.warning(f"🚫 Blocked suspicious memory", extra={"user_id": user_id})
-
-            if not safe_memories:
-                logger.warning(f"⚠️  All memories filtered as suspicious", extra={"user_id": user_id})
-                return []
-
-            # ✅ FIXED Issue #24: Add untrusted warning
-            result = [ContextBuilder.UNTRUSTED_WARNING]
-            for i, mem in enumerate(safe_memories, 1):
-                result.append(f"{i}. {mem}")
-
-            logger.info(f"✅ Retrieved {len(safe_memories)} safe memories", extra={"user_id": user_id})
+            # ✅ Get rolling 500-message summary (ALL users, not just premium)
+            summaries = await memory_service.search(
+                user_id, vector, top_k=1, memory_type="summary"
+            )
+            
+            if summaries:
+                result.append("CONVERSATION CONTEXT")
+                result.append(summaries[0])
+            
+            # ✅ Premium users: get preferences
+            if (profile.account_tier or "").strip() == "premium":
+                prefs = await memory_service.search(
+                    user_id, vector, top_k=3, memory_type="preference"
+                )
+                if prefs:
+                    result.append("\nREMEMBERED PREFERENCES")
+                    for p in prefs:
+                        result.append(f"- {p}")
+            
+            if result:
+                result.insert(0, ContextBuilder.UNTRUSTED_WARNING)
+                logger.info(
+                    f"✅ Retrieved memories",
+                    extra={"user_id": user_id, "count": len(result)}
+                )
+            
             return result
 
         except Exception:

@@ -1,4 +1,3 @@
-
 import asyncio
 import json
 import logging
@@ -247,6 +246,106 @@ class LLMService:
         except json.JSONDecodeError:
             return None
         return data if isinstance(data, dict) else None
+
+    # --------------------------------------------------------- summarization
+    async def summarize_messages(
+        self,
+        messages: List[Dict[str, str]],
+        previous_summary: Optional[str] = None,
+    ) -> str:
+        """
+        ✅ NEW: Compress messages into ONE paragraph, considering previous summary.
+        
+        If previous_summary exists:
+          - Integrate old context with new developments
+          - Preserve important past context
+          - Add new topics/patterns from recent messages
+        
+        If no previous_summary:
+          - Create fresh summary from scratch
+        """
+        # Build readable transcript
+        transcript = "\n".join(
+            f"{m['role'].upper()}: {m['content'][:200]}"
+            for m in messages[-500:]  # Last 500
+        )
+        
+        # ✅ KEY: Include previous summary in the prompt
+        if previous_summary:
+            context = (
+                f"PREVIOUS SUMMARY (from earlier conversations):\n{previous_summary}\n\n"
+                f"NEW MESSAGES SINCE THEN:\n{transcript}"
+            )
+            instruction = (
+                "Update the summary by:\n"
+                "1. Keeping important context from the previous summary\n"
+                "2. Adding new topics, developments, and patterns from recent messages\n"
+                "3. Noting how the conversation has evolved\n"
+                "Write ONE clear paragraph that integrates both old and new."
+            )
+        else:
+            context = f"CONVERSATION TO SUMMARIZE:\n{transcript}"
+            instruction = (
+                "Write ONE clear, concise paragraph that captures:\n"
+                "- Main topics and themes\n"
+                "- User's goals, context, and background\n"
+                "- Key patterns in how they communicate"
+            )
+        
+        system = (
+            "You are a conversation summarizer. Read the context below and write "
+            "ONE clear, concise paragraph (4-6 sentences) that captures the essence "
+            "of the conversation.\n\n"
+            f"{instruction}\n\n"
+            "Be factual. Omit pleasantries. Focus on what matters for future conversations."
+        )
+        
+        prompt = f"{context}\n\nWrite the updated summary paragraph:"
+        
+        return await self.chat(
+            system=system,
+            user=prompt,
+            temperature=0.3,
+            max_tokens=400,
+        )
+
+    async def extract_preferences(
+        self,
+        messages: List[Dict[str, str]]
+    ) -> Optional[List[str]]:
+        """
+        ✅ NEW: Extract explicit/implied preferences from conversation.
+        
+        Returns list of preference strings or None.
+        
+        Example output:
+        ["Prefers code examples over explanations", 
+         "Wants concise answers (max 2-3 sentences)",
+         "Interested in machine learning applications"]
+        """
+        transcript = "\n".join(
+            f"{m['role'].upper()}: {m['content'][:150]}"
+            for m in messages[-500:]
+        )
+        
+        system = (
+            "You are analyzing a user's conversation history to extract their preferences. "
+            "Output ONLY a JSON array of strings. Each string is ONE preference.\n"
+            "Examples:\n"
+            '["Prefers detailed technical explanations",'
+            '"Dislikes bullet points, wants prose",'
+            '"Interested in AI/ML topics"]'
+        )
+        
+        prompt = f"Extract 2-5 preferences from this conversation:\n\n{transcript}"
+        
+        result = await self.extract(
+            instruction=system,
+            user_message=prompt,
+            max_tokens=300,
+        )
+        
+        return result if isinstance(result, list) else None
 
     # ----------------------------------------------------------------- legacy
     async def get_response(

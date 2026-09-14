@@ -1,17 +1,4 @@
-"""AI Companion Platform - FastAPI Backend
-Pure chat-based authentication with unified Web + WhatsApp support
 
-FIXED: Event loop closed error using nest_asyncio
-FIXED: Issue #19 - Rate limiting added to prevent DDoS
-FIXED: Issue #27 - Lazy load embedding model (no warmup on startup)
-FIXED: Issue #28 - Track dependency health status
-FIXED: Added plain GET /health — health_routes.router only exposes
-       /health/live, /health/ready, /health/detailed, /health/dependencies,
-       and /health/health (backward-compat route + prefix collision).
-       Bare /health was never actually registered, so any client (e.g.
-       Streamlit) hitting /health directly got a 404 even though the
-       backend was fully up.
-"""
 
 import asyncio
 import logging
@@ -88,7 +75,9 @@ def _quiet_noisy_loggers():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events"""
-    # Startup
+    # ═════════════════════════════════════════════════════════
+    # STARTUP
+    # ═════════════════════════════════════════════════════════
 
     try:
         validate_settings_on_startup()
@@ -97,9 +86,9 @@ async def lifespan(app: FastAPI):
         logger.critical(f"❌ Config validation failed: {e}")
         raise SystemExit(1)
     
-    logger.info("=" * 60)
+    logger.info("=" * 70)
     logger.info("🚀 AI Companion Platform Starting...")
-    logger.info("=" * 60)
+    logger.info("=" * 70)
     logger.info(f"⏰ Startup time: {datetime.now().isoformat()}")
     
     # ✅ FIXED #28: Initialize and check dependencies
@@ -119,30 +108,38 @@ async def lifespan(app: FastAPI):
     logger.info(f"🤖 LLM: Groq ({settings.GROQ_MODEL})")
 
     from app.services.whatsapp_service import whatsapp_service
-    logger.info("WhatsApp service initialized")
+    logger.info("📱 WhatsApp service initialized")
 
-    # FIXED (Issue #13): Start scheduler with async-compatible job
+    # ═════════════════════════════════════════════════════════
+    # START COMBINED SCHEDULER (Reminders + Summaries)
+    # ═════════════════════════════════════════════════════════
+    
     try:
         if not scheduler.running:
             # Get database session for scheduler
             db = get_db().__next__()
             reminder_service = get_reminder_scheduler_service(db)
             
-            # FIXED: Wrap async function for APScheduler
-            # asyncio.run() is now safe to use repeatedly thanks to nest_asyncio
+            # ✅ NEW: Register combined job that handles BOTH:
+            #    1. Reminder dispatch (every check)
+            #    2. Message summarization (every 6 hours)
             scheduler.add_job(
-                lambda: asyncio.run(reminder_service.send_reminders()),
+                lambda: asyncio.run(
+                    reminder_service.process_scheduled_tasks()  # ← Combined function!
+                ),
                 trigger="interval",
-                minutes=1,  # Run every minute for testing, change to 5 for production
-                id="reminder_dispatcher",
-                name="Reminder Dispatcher",
+                minutes=1,  # Check every 1 minute
+                id="process_scheduled_tasks",
+                name="Process Reminders & Summaries",
                 replace_existing=True
             )
             
             scheduler.start()
             dependency_health.set_status("scheduler", "up")  # ✅ FIXED #28
-            logger.info("✅ APScheduler started (reminders every 1 minute)")
-            logger.info("   Job: reminder_dispatcher (async-aware wrapper with nest_asyncio)")
+            logger.info("✅ APScheduler started")
+            logger.info("   📌 Reminders: Checked every 1 minute")
+            logger.info("   📝 Summaries: Generated every 6 hours (checked every 1 minute)")
+            logger.info("   🔄 Combined job: process_scheduled_tasks (async-aware with nest_asyncio)")
         else:
             logger.info("✅ APScheduler already running")
             dependency_health.set_status("scheduler", "up")  # ✅ FIXED #28
@@ -159,11 +156,20 @@ async def lifespan(app: FastAPI):
     # This saves 60+ seconds on startup (4 workers) and 75% RAM.
     logger.info("ℹ️  Embedding model will load on first use (lazy loading)")
     logger.info("   First request may take 5-10s, subsequent requests instant")
+    
+    logger.info("=" * 70)
+    logger.info("✅ Startup Complete - API Ready")
+    logger.info("=" * 70)
 
     yield
 
-    # Shutdown
+    # ═════════════════════════════════════════════════════════
+    # SHUTDOWN
+    # ═════════════════════════════════════════════════════════
+    
+    logger.info("=" * 70)
     logger.info("🛑 Shutting down...")
+    logger.info("=" * 70)
     
     # ✅ FIXED #28: Mark dependencies as down on shutdown
     dependency_health.set_status("postgres", "down", "Shutdown")
@@ -176,10 +182,15 @@ async def lifespan(app: FastAPI):
             logger.info("✅ APScheduler stopped")
     except Exception as e:
         logger.error(f"❌ Error stopping scheduler: {e}")
+    
     logger.info("👋 Goodbye!")
+    logger.info("=" * 70)
 
 
-# Create FastAPI app
+# ═════════════════════════════════════════════════════════════════════════════
+# CREATE FASTAPI APP
+# ═════════════════════════════════════════════════════════════════════════════
+
 app = FastAPI(
     title="AI Companion Platform",
     description="Chat-based AI companion with unified Web & WhatsApp context",
@@ -219,6 +230,10 @@ async def rate_limit_handler(request, exc):
     }
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# MIDDLEWARE
+# ═════════════════════════════════════════════════════════════════════════════
+
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -228,7 +243,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ================================================================ ROUTES
+# ═════════════════════════════════════════════════════════════════════════════
+# ROUTES
+# ═════════════════════════════════════════════════════════════════════════════
 
 # ✅ FIXED #28: Include health routes with proper prefix
 # NOTE: this exposes /health/live, /health/ready, /health/detailed,
@@ -244,15 +261,24 @@ app.include_router(reminder_routes.router, prefix="/reminders", tags=["reminders
 app.include_router(whatsapp_routes.router, tags=["whatsapp"])  # WhatsApp webhook
 
 
-# Root endpoint
+# ═════════════════════════════════════════════════════════════════════════════
+# BASIC ENDPOINTS
+# ═════════════════════════════════════════════════════════════════════════════
+
 @app.get("/")
 def root():
-    """Root endpoint"""
+    """
+    Root endpoint - Welcome message
+    """
     return {
         "message": "🤖 AI Companion Platform API",
         "status": "running",
         "docs": "/docs",
         "version": "1.0.0",
+        "scheduler": {
+            "reminders": "Every 1 minute",
+            "summaries": "Every 6 hours"
+        }
     }
 
 
@@ -262,9 +288,20 @@ def root():
 # (live, ready, detailed, dependencies) and never registered bare /health.
 @app.get("/health")
 def simple_health():
-    """Lightweight liveness check for frontend clients."""
-    return {"status": "ok"}
+    """
+    Lightweight liveness check for frontend clients.
+    Returns 200 if backend is running.
+    """
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "scheduler_running": scheduler.running,
+    }
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     import uvicorn
