@@ -13,7 +13,30 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-HISTORY_LIMIT = 300
+# FIXED: was a flat HISTORY_LIMIT = 300 (leftover from llm_service.
+# summarize_messages(), which slices the last 500 messages for the background
+# 6-hourly summary job — a completely different code path). That was the
+# direct cause of the 8000-TPM 413s ("Requested 8090").
+#
+# A flat message COUNT is the wrong lever either way: short exchanges waste
+# available budget, long ones can still blow it. Use a token BUDGET instead —
+# keep walking backward from the most recent message until the budget runs
+# out. 3000 is conservative: system prompt (~500-700) + memory/summary
+# (~200-400) + response budget (1400, see llm_service.chat's default
+# max_tokens) + current message leaves real headroom under the 8000 cap, with
+# margin for concurrent requests.
+#
+# This is the SHORT-TERM context only. Long-term continuity across a whole
+# conversation is the Qdrant rolling summary in _memories() below, refreshed
+# every 6 hours over up to 500 messages - that's the actual mechanism for not
+# losing context, not the raw message list here.
+MAX_HISTORY_MESSAGES = 100  # hard ceiling regardless of token math, so the DB
+                             # query and payload size stay bounded even for a
+                             # long run of very short messages
+HISTORY_TOKEN_BUDGET = 3000
+_CHARS_PER_TOKEN_ESTIMATE = 4  # rough English heuristic - a safety margin,
+                                 # not an exact tokenizer; see the usage-logging
+                                 # note in llm_service.py to calibrate this for real
 MEMORY_TOP_K = 5
 
 
@@ -108,6 +131,10 @@ class ContextBuilder:
             return datetime.now(ZoneInfo("UTC"))
 
     @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        return max(1, len(text) // _CHARS_PER_TOKEN_ESTIMATE)
+
+    @staticmethod
     def _history(
         db: Session,
         user_id: int,
@@ -115,7 +142,7 @@ class ContextBuilder:
         exclude_message_id: Optional[int],
     ) -> List[Dict[str, str]]:
         try:
-            rows = MessageRepository.get_last_n(db, user_id, HISTORY_LIMIT + 1) or []
+            rows = MessageRepository.get_last_n(db, user_id, MAX_HISTORY_MESSAGES + 1) or []
         except Exception:
             logger.exception("Could not load history for user %s", user_id)
             return []
@@ -135,15 +162,28 @@ class ContextBuilder:
             if getattr(last, "role", "") == "user" and (last.content or "").strip() == current_message.strip():
                 rows = rows[:-1]
 
-        rows = rows[-HISTORY_LIMIT:]
+        rows = rows[-MAX_HISTORY_MESSAGES:]
 
-        history: List[Dict[str, str]] = []
-        for m in rows:
-            role = "assistant" if getattr(m, "role", "") == "assistant" else "user"
+        # Walk backward from most recent, keeping whatever fits the token
+        # budget. A run of short messages keeps far more of them than a flat
+        # count would; a run of long ones is trimmed harder, automatically.
+        # Always keep at least the single most recent message even if it
+        # alone is over budget, so a chat turn is never sent with zero history.
+        kept: List[Dict[str, str]] = []
+        used_tokens = 0
+        for m in reversed(rows):
             content = (m.content or "").strip()
-            if content:
-                history.append({"role": role, "content": content})
-        return history
+            if not content:
+                continue
+            cost = ContextBuilder._estimate_tokens(content)
+            if kept and used_tokens + cost > HISTORY_TOKEN_BUDGET:
+                break
+            used_tokens += cost
+            role = "assistant" if getattr(m, "role", "") == "assistant" else "user"
+            kept.append({"role": role, "content": content})
+
+        kept.reverse()  # back to oldest -> newest
+        return kept
 
     @staticmethod
     async def _memories(profile, user_id: int, current_message: str) -> List[str]:

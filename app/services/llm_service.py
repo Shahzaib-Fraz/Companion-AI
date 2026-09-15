@@ -4,7 +4,7 @@ import logging
 import re
 from typing import Any, Dict, List, Optional
 
-from groq import Groq
+from groq import APIStatusError, Groq, RateLimitError
 
 from app.core.config import settings
 
@@ -17,6 +17,14 @@ REASONING_EFFORT: str = getattr(settings, "GROQ_REASONING_EFFORT", None) or "non
 
 MAX_TOKEN_CEILING = 4096
 MAX_ATTEMPTS = 6
+
+# FIXED: 429 (rate limit) and 413 (single request over the TPM cap) used to
+# fall straight into the generic "log and break" path after one try, relying
+# entirely on the Groq SDK's own short internal retry. Now backed off
+# explicitly, capped so a single chat turn never blocks too long.
+MAX_RATE_LIMIT_RETRIES = 2
+MAX_RATE_LIMIT_WAIT_SECONDS = 15.0
+_RETRY_AFTER_RE = re.compile(r"try again in ([\d.]+)s", re.IGNORECASE)
 
 # Reasoning that leaked into content despite our settings.
 _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -59,6 +67,27 @@ class LLMService:
 
         return payload
 
+    @staticmethod
+    def _retry_after_seconds(exc: BaseException, default: float = 5.0) -> float:
+        """Best-effort read of how long Groq wants us to wait before retrying."""
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                header = response.headers.get("retry-after")
+                if header:
+                    return float(header)
+            except Exception:
+                pass
+
+        match = _RETRY_AFTER_RE.search(str(exc))
+        if match:
+            try:
+                return float(match.group(1))
+            except ValueError:
+                pass
+
+        return default
+
     async def _create(
         self,
         *,
@@ -69,6 +98,7 @@ class LLMService:
     ) -> str:
         budget = max_tokens
         last_error: Optional[BaseException] = None
+        rate_limit_retries = 0
 
         for attempt in range(1, MAX_ATTEMPTS + 1):
             payload = self._payload(messages, temperature, budget, json_mode)
@@ -77,6 +107,28 @@ class LLMService:
                 response = await asyncio.to_thread(
                     self.client.chat.completions.create, **payload
                 )
+            except (RateLimitError, APIStatusError) as exc:
+                # FIXED: explicit, capped backoff for 429 (cumulative TPM burn)
+                # and 413 (single request over the TPM cap). Previously these
+                # fell straight to "log and break" after one attempt.
+                last_error = exc
+                status = getattr(exc, "status_code", None)
+                is_capacity_error = status in (429, 413) or "rate_limit_exceeded" in str(exc).lower()
+
+                if is_capacity_error and rate_limit_retries < MAX_RATE_LIMIT_RETRIES:
+                    rate_limit_retries += 1
+                    wait = min(self._retry_after_seconds(exc), MAX_RATE_LIMIT_WAIT_SECONDS)
+                    logger.warning(
+                        "Groq capacity error (status=%s) on attempt %d/%d; waiting "
+                        "%.1fs before retry (%d/%d capacity retries used)",
+                        status, attempt, MAX_ATTEMPTS, wait,
+                        rate_limit_retries, MAX_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+                logger.error("Groq capacity error, retries exhausted: %s", exc)
+                break
             except Exception as exc:
                 last_error = exc
                 detail = str(exc).lower()
@@ -119,6 +171,14 @@ class LLMService:
 
             text = self._content(response)
             if text:
+                usage = getattr(response, "usage", None)
+                if usage:
+                    logger.info(
+                        "Groq usage: prompt=%s completion=%s total=%s",
+                        getattr(usage, "prompt_tokens", "?"),
+                        getattr(usage, "completion_tokens", "?"),
+                        getattr(usage, "total_tokens", "?"),
+                    )
                 return text
 
             # HTTP 200 with nothing usable: almost always reasoning eating the

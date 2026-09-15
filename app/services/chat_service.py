@@ -415,6 +415,18 @@ class ChatService:
                 "Ask them what date and time they want it, in one sentence."
             )
 
+        # NEW: reminder_service couldn't resolve a vague pointer ("this", "that",
+        # "it") against recent chat history — e.g. no relevant history, or an
+        # empty conversation. Ask instead of silently dropping the request.
+        if reminder_result["status"] == "needs_clarification":
+            return (
+                "\n\nSYSTEM FACT — this already happened, treat it as done:\n"
+                f'They asked for a reminder but only referred to it as '
+                f'"{reminder_result["content"]}", and there\'s nothing in the recent '
+                "conversation to tell what that is. Ask them, in one sentence, what "
+                "exactly they want to be reminded about."
+            )
+
         return ""
 
     @staticmethod
