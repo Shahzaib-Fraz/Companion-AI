@@ -7,7 +7,7 @@ class Settings(BaseSettings):
     """Application settings with Pydantic v2 compatible configuration"""
     
     # Database
-    DATABASE_URL: str = "postgresql://postgres:root@localhost:5432/ai-companion"
+    DATABASE_URL: str = "postgresql://postgres:root@localhost:5432/ai_companion"
     
     # JWT
     JWT_SECRET: str = ""

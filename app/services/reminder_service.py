@@ -1,4 +1,3 @@
-
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
@@ -87,7 +86,12 @@ class ReminderService:
                 "local_time": self._format(when_local),
             }
 
-        reminder = Reminder(user_id=user_id, content=content, scheduled_at=when_utc)
+        reminder = Reminder(
+            user_id=user_id,
+            content=content,
+            scheduled_at=when_utc,
+            timezone=str(tz),
+        )
         db.add(reminder)
         db.commit()
         db.refresh(reminder)
@@ -102,8 +106,7 @@ class ReminderService:
             "local_time": self._format(when_local),
         }
 
-    # ADD THIS METHOD to your ReminderService class in app/services/reminder_service.py
-# Place it AFTER the maybe_create() method
+
 
     async def maybe_create_from_scheduled_at(  
     self,
@@ -171,6 +174,7 @@ class ReminderService:
             user_id=user_id,
             content=content,
             scheduled_at=when_utc,
+            timezone=str(tz),
             attempt_count=0,
             last_attempt_at=None,
             last_failure_reason=None,

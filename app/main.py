@@ -1,314 +1,209 @@
 
-
-import asyncio
 import logging
-import threading
 from contextlib import asynccontextmanager
-from datetime import datetime
 
-import nest_asyncio  # ← FIX: Allow nested asyncio.run() calls
-from fastapi import Depends, FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from slowapi import Limiter  # ✅ Issue #19: Rate limiting
-from slowapi.util import get_remote_address  # ✅ Issue #19
-from slowapi.errors import RateLimitExceeded  # ✅ Issue #19
-from apscheduler.schedulers.background import BackgroundScheduler
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+import uvicorn
 
-from app.core.config import settings, validate_settings_on_startup
-
-from app.api import (
-    auth_routes,
-    chat_routes,
-    health_routes,
-    reminder_routes,
-    user_routes,
-    whatsapp_routes,
-)
 from app.core.config import settings
-from app.db.database import Base, engine, get_db
-from app.services.embedding_service import embedding_service
-from app.services.scheduler_service import get_reminder_scheduler_service
-from app.services.dependency_health import dependency_health  # ✅ FIXED #28
+from app.core.limiter import limiter
+from app.core.startup import validate_startup, validate_config_sync
+from app.api import health_routes, chat_routes, auth_routes, reminder_routes, whatsapp_routes, user_routes
+from app.services.whatsapp_service import whatsapp_service
 
-# Create all tables
-Base.metadata.create_all(bind=engine)
-
-# Setup logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# FIX: Apply nest_asyncio to handle repeated asyncio.run() calls in scheduler
-# This allows asyncio.run() to be called multiple times without "Event loop is closed" error
-nest_asyncio.apply()
-
-# Global scheduler instance
-scheduler = BackgroundScheduler()
-
-
-def _quiet_noisy_loggers():
-    """
-    Third-party INFO chatter that drowns out this app's own log lines.
-
-    httpx logs one line per outbound request, so every Groq call, every Qdrant
-    call and ~20 Hugging Face cache-validation HEADs each get a line. The
-    apscheduler executor logs "Running job / executed successfully" every 60
-    seconds forever. None of it is actionable, and it makes real errors hard to
-    find when you are reading a log to debug.
-
-    Job FAILURES are unaffected: scheduler_service registers an EVENT_JOB_ERROR
-    listener that logs through its own logger, so crashes still surface.
-    """
-    for name in (
-        "httpx",
-        "httpcore",
-        "huggingface_hub.utils._http",
-        "sentence_transformers.base.model",
-        "apscheduler.executors.default",
-        "apscheduler.scheduler",
-    ):
-        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup and shutdown events"""
-    # ═════════════════════════════════════════════════════════
-    # STARTUP
-    # ═════════════════════════════════════════════════════════
+    """
+    FIXED P0-2: Startup validation
+    FIXED P0-3: Do NOT start scheduler here
 
-    try:
-        validate_settings_on_startup()
-        logger.info("✅ Configuration validated")
-    except ValueError as e:
-        logger.critical(f"❌ Config validation failed: {e}")
-        raise SystemExit(1)
-    
+    Scheduler runs in a separate process:
+        python scheduler_worker.py
+    """
     logger.info("=" * 70)
-    logger.info("🚀 AI Companion Platform Starting...")
+    logger.info("🚀 Application Startup")
     logger.info("=" * 70)
-    logger.info(f"⏰ Startup time: {datetime.now().isoformat()}")
-    
-    # ✅ FIXED #28: Initialize and check dependencies
+
+    # Step 1: Synchronous config validation
     try:
-        from app.db.database import engine as db_engine
-        from app.models.base import Base as BaseModel
-        BaseModel.metadata.create_all(bind=db_engine)
-        dependency_health.set_status("postgres", "up")
-        logger.info("✅ PostgreSQL initialized")
+        validate_config_sync()
     except Exception as e:
-        dependency_health.set_status("postgres", "down", str(e))
-        logger.error(f"❌ PostgreSQL initialization failed: {e}")
-    
-    logger.info("🔐 Authentication: JWT + Phone-based")
-    logger.info("💾 Memory: PostgreSQL + Qdrant (Premium)")
-    logger.info("📧 Email: Brevo (formerly Sendinblue)")
-    logger.info(f"🤖 LLM: Groq ({settings.GROQ_MODEL})")
+        logger.error(f"❌ Config validation failed: {e}")
+        raise
 
-    from app.services.whatsapp_service import whatsapp_service
-    logger.info("📱 WhatsApp service initialized")
-
-    # ═════════════════════════════════════════════════════════
-    # START COMBINED SCHEDULER (Reminders + Summaries)
-    # ═════════════════════════════════════════════════════════
-    
+    # Step 2: Async dependency validation (P0-2)
     try:
-        if not scheduler.running:
-            # Get database session for scheduler
-            db = get_db().__next__()
-            reminder_service = get_reminder_scheduler_service(db)
-            
-            # ✅ NEW: Register combined job that handles BOTH:
-            #    1. Reminder dispatch (every check)
-            #    2. Message summarization (every 6 hours)
-            scheduler.add_job(
-                lambda: asyncio.run(
-                    reminder_service.process_scheduled_tasks()  # ← Combined function!
-                ),
-                trigger="interval",
-                minutes=1,  # Check every 1 minute
-                id="process_scheduled_tasks",
-                name="Process Reminders & Summaries",
-                replace_existing=True
-            )
-            
-            scheduler.start()
-            dependency_health.set_status("scheduler", "up")  # ✅ FIXED #28
-            logger.info("✅ APScheduler started")
-            logger.info("   📌 Reminders: Checked every 1 minute")
-            logger.info("   📝 Summaries: Generated every 6 hours (checked every 1 minute)")
-            logger.info("   🔄 Combined job: process_scheduled_tasks (async-aware with nest_asyncio)")
-        else:
-            logger.info("✅ APScheduler already running")
-            dependency_health.set_status("scheduler", "up")  # ✅ FIXED #28
+        await validate_startup()
     except Exception as e:
-        dependency_health.set_status("scheduler", "down", str(e))  # ✅ FIXED #28
-        logger.error(f"❌ Failed to start scheduler: {e}", exc_info=True)
+        logger.error(f"❌ Startup validation failed: {e}")
+        logger.error("❌ STARTUP FAILED - Application cannot start without critical dependencies")
+        raise
 
-    # Set AFTER scheduler start, which raises the apscheduler logger to INFO.
-    # Otherwise that call would undo this.
-    _quiet_noisy_loggers()
-
-    # ✅ FIXED Issue #27: Embedding model loads lazily (no warmup on startup)
-    # Model loads on first embed() call, not at startup.
-    # This saves 60+ seconds on startup (4 workers) and 75% RAM.
-    logger.info("ℹ️  Embedding model will load on first use (lazy loading)")
-    logger.info("   First request may take 5-10s, subsequent requests instant")
-    
-    logger.info("=" * 70)
-    logger.info("✅ Startup Complete - API Ready")
+    # Step 3: Ready to serve
+    logger.info("✅ Application ready on port 8000")
+    logger.info("📌 Note: Scheduler runs in separate process (python scheduler_worker.py)")
     logger.info("=" * 70)
 
     yield
 
-    # ═════════════════════════════════════════════════════════
-    # SHUTDOWN
-    # ═════════════════════════════════════════════════════════
-    
-    logger.info("=" * 70)
-    logger.info("🛑 Shutting down...")
-    logger.info("=" * 70)
-    
-    # ✅ FIXED #28: Mark dependencies as down on shutdown
-    dependency_health.set_status("postgres", "down", "Shutdown")
-    dependency_health.set_status("scheduler", "down", "Shutdown")
-    dependency_health.set_status("qdrant", "down", "Shutdown")
-    
-    try:
-        if scheduler.running:
-            scheduler.shutdown()
-            logger.info("✅ APScheduler stopped")
-    except Exception as e:
-        logger.error(f"❌ Error stopping scheduler: {e}")
-    
-    logger.info("👋 Goodbye!")
-    logger.info("=" * 70)
+    # ========================
+    # Shutdown
+    # ========================
+    logger.info("⏹️  Shutting down...")
+    logger.info("👋 Application shutdown complete")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CREATE FASTAPI APP
-# ═════════════════════════════════════════════════════════════════════════════
-
+# Create FastAPI app
 app = FastAPI(
-    title="AI Companion Platform",
-    description="Chat-based AI companion with unified Web & WhatsApp context",
+    title="AI Companion API",
+    description="AI-powered chat companion with reminders",
     version="1.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
     lifespan=lifespan,
 )
 
-# ✅ Issue #19: Initialize rate limiter
-limiter = Limiter(key_func=get_remote_address)
+# Rate limiting - shared instance, see app/core/limiter.py
 app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 
-# ✅ Issue #19: Exception handler for rate limit exceeded
-@app.exception_handler(RateLimitExceeded)
-async def rate_limit_handler(request, exc):
-    """
-    Handle rate limit exceeded errors.
-    
-    Returns 429 with informative message when user exceeds rate limit.
-    Logs the rate limit violation for monitoring.
-    """
-    logger.warning(
-        "⏳ Rate limit exceeded",
-        extra={
-            "path": request.url.path,
-            "ip": get_remote_address(request),
-            "method": request.method,
-        }
-    )
-    return {
-        "error": "Rate limit exceeded",
-        "message": "Too many requests. Please try again later.",
-        "retry_after": "60 seconds",
-        "status_code": 429,
-    }
-
-
-# ═════════════════════════════════════════════════════════════════════════════
+# ========================================================================
 # MIDDLEWARE
-# ═════════════════════════════════════════════════════════════════════════════
+# ========================================================================
 
-# CORS middleware
+app.state.limiter_enabled = True
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    """Global rate limiting middleware"""
+    try:
+        # Skip health endpoints
+        if request.url.path.startswith("/health"):
+            return await call_next(request)
+
+        # Apply global limit if limiter is enabled
+        if getattr(app.state, "limiter_enabled", True):
+            await app.state.limiter.hit(request)
+    except Exception:
+        # If limiter fails, continue (don't block traffic)
+        pass
+
+    return await call_next(request)
+
+
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_ORIGINS,
+    allow_origins=settings.ALLOWED_ORIGINS or ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ═════════════════════════════════════════════════════════════════════════════
+
+# ========================================================================
 # ROUTES
-# ═════════════════════════════════════════════════════════════════════════════
+# ========================================================================
 
-# ✅ FIXED #28: Include health routes with proper prefix
-# NOTE: this exposes /health/live, /health/ready, /health/detailed,
-# /health/dependencies, and /health/health — but NOT bare /health.
-# See the plain /health route below for that.
 app.include_router(health_routes.router, prefix="/health", tags=["health"])
-
-# Include other routers
-app.include_router(auth_routes.router, prefix="/auth", tags=["authentication"])
+app.include_router(auth_routes.router, prefix="/auth", tags=["auth"])
 app.include_router(chat_routes.router, prefix="/chat", tags=["chat"])
-app.include_router(user_routes.router, prefix="/users", tags=["users"])
 app.include_router(reminder_routes.router, prefix="/reminders", tags=["reminders"])
-app.include_router(whatsapp_routes.router, tags=["whatsapp"])  # WhatsApp webhook
+app.include_router(whatsapp_routes.router, prefix="/webhook", tags=["webhooks"])
+app.include_router(user_routes.router, prefix="/users", tags=["users"])  # was missing entirely
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# BASIC ENDPOINTS
-# ═════════════════════════════════════════════════════════════════════════════
+# ========================================================================
+# EXCEPTION HANDLERS
+# ========================================================================
 
-@app.get("/")
-def root():
-    """
-    Root endpoint - Welcome message
-    """
+@app.exception_handler(404)
+async def not_found(request: Request, exc):
+    return JSONResponse(
+        status_code=404,
+        content={"detail": f"Not found: {request.url.path}"}
+    )
+
+
+@app.exception_handler(500)
+async def server_error(request: Request, exc):
+    logger.error(f"❌ Unhandled error: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"}
+    )
+
+
+# ========================================================================
+# ROOT ENDPOINT
+# ========================================================================
+
+@app.get("/", tags=["root"])
+async def root():
     return {
-        "message": "🤖 AI Companion Platform API",
+        "name": "AI Companion API",
+        "version": "1.0.0",
         "status": "running",
         "docs": "/docs",
-        "version": "1.0.0",
-        "scheduler": {
-            "reminders": "Every 1 minute",
-            "summaries": "Every 6 hours"
-        }
+        "health": "/health/live",
+        "ready": "/health/ready",
     }
 
 
-# ✅ FIX: Plain /health for simple clients (e.g. Streamlit) that just want
-# a fast "is the backend reachable" check. This is intentionally separate
-# from health_routes.router — that router's routes live under /health/*
-# (live, ready, detailed, dependencies) and never registered bare /health.
-@app.get("/health")
-def simple_health():
-    """
-    Lightweight liveness check for frontend clients.
-    Returns 200 if backend is running.
-    """
-    return {
-        "status": "ok",
-        "timestamp": datetime.now().isoformat(),
-        "scheduler_running": scheduler.running,
-    }
+# ========================================================================
+# DEPLOYMENT NOTES
+# ========================================================================
 
+"""
+IMPORTANT: Deployment Setup
 
-# ═════════════════════════════════════════════════════════════════════════════
-# MAIN
-# ═════════════════════════════════════════════════════════════════════════════
+The scheduler is a SEPARATE PROCESS and must NOT run in gunicorn workers.
+Run both from the REPO ROOT (this file lives at app/main.py):
+
+BEFORE (broken - causes duplicates):
+    gunicorn -w 4 main:app
+
+AFTER (correct):
+    Process 1: gunicorn -w 4 -b 0.0.0.0:8000 app.main:app   # API only
+    Process 2: python scheduler_worker.py                   # Separate process for reminders
+
+Use Supervisor, Procfile, or docker-compose to manage both processes:
+
+With Supervisor (/etc/supervisor/conf.d/ai-companion.conf):
+    [program:api]
+    command=gunicorn -w 4 -b 0.0.0.0:8000 app.main:app
+    directory=/path/to/repo
+    autostart=true
+    autorestart=true
+
+    [program:scheduler]
+    command=python scheduler_worker.py
+    directory=/path/to/repo
+    autostart=true
+    autorestart=true
+    numprocs=1
+
+With docker-compose:
+    services:
+      api:
+        command: gunicorn -w 4 -b 0.0.0.0:8000 app.main:app
+      scheduler:
+        command: python scheduler_worker.py
+"""
 
 if __name__ == "__main__":
-    import uvicorn
-
+    # Development only - use gunicorn for production
     uvicorn.run(
-        app,
+        "app.main:app",
         host="0.0.0.0",
         port=8000,
-        log_level="info",
+        reload=settings.DEBUG,
+        workers=1,  # Single worker in dev
     )

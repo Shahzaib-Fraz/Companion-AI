@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 
 from app.db.database import get_db
 from app.services.reminder_service import reminder_service
+from app.schemas.schemas import PIIMasker
+from app.repositories.user_repository import UserRepository
 from app.core.security import verify_access_token
 
 logger = logging.getLogger(__name__)
@@ -23,7 +25,15 @@ class CreateReminderRequest(BaseModel):
         ...,
         description="ISO 8601 datetime with timezone: '2026-09-15T14:30:00+05:00'",
     )
-    user_timezone: str = Field(default="UTC")
+    user_timezone: Optional[str] = Field(
+        default=None,
+        description=(
+            "Deprecated / informational only. P0-11 FIX: the authenticated "
+            "user's stored profile timezone is now authoritative for "
+            "scheduling - this field, if sent, is accepted for backward "
+            "compatibility but ignored."
+        ),
+    )
 
 
 class ReminderResponse(BaseModel):
@@ -42,38 +52,38 @@ async def create_reminder(
 ):
     """
     Create a reminder via API.
-    
+
     Requires JWT token in Authorization header: Bearer <token>
-    
-    FIXED: Now delegates to reminder_service.maybe_create_from_scheduled_at()
-    This ensures timezone handling is consistent with chat reminders.
-    Fixes issue #4 (inconsistent timezone handling).
-    
+
+    P0-11 FIX: this used to trust req.user_timezone (an arbitrary
+    client-supplied string) as the timezone for scheduling/display. It
+    now always looks up the authenticated user's own stored
+    profile.timezone and uses that instead - a client can no longer
+    cause a reminder to be scheduled/displayed against a timezone that
+    isn't the one actually on file for their account.
+
     Args:
         req: CreateReminderRequest containing content, scheduled_at_iso, user_timezone
         db: Database session
         authorization: JWT token in Authorization header
-        
+
     Returns:
         ReminderResponse with created reminder details
-        
+
     Raises:
         HTTPException: If token is missing, invalid, or reminder creation fails
     """
-    
+
     # ========== AUTHENTICATION ==========
-    # Extract and verify JWT token from Authorization header
     if not authorization or not authorization.startswith("Bearer "):
         logger.warning("Missing or malformed authorization header")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or invalid authorization token. Use: Authorization: Bearer <token>",
         )
-    
-    # Extract token (remove "Bearer " prefix)
+
     token = authorization.replace("Bearer ", "")
-    
-    # Verify token and get user_id
+
     user_id = verify_access_token(token)
     if user_id is None:
         logger.warning("Invalid or expired token provided")
@@ -81,75 +91,83 @@ async def create_reminder(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",
         )
-    
+
     # ========== VALIDATION ==========
     try:
-        # Parse ISO 8601 datetime with timezone
         scheduled_at = datetime.fromisoformat(req.scheduled_at_iso)
-        
-        # Ensure timezone info is present
+
         if scheduled_at.tzinfo is None:
             raise ValueError(
                 f"scheduled_at_iso must include timezone (got {req.scheduled_at_iso!r})"
             )
-        
+
     except ValueError as exc:
         logger.warning("Invalid datetime from user %d: %s", user_id, exc)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid scheduled_at_iso: {exc}",
         )
-    
+
+    # ========== AUTHORITATIVE TIMEZONE ==========
+    # P0-11 FIX: never trust req.user_timezone. The stored profile
+    # timezone (set during onboarding / profile update, both of which now
+    # validate against the real IANA database - see onboarding_service and
+    # user_routes.py) is the single source of truth.
+    profile = UserRepository.get_or_create_profile(db, user_id)
+    authoritative_timezone = (profile.timezone if profile else None) or "UTC"
+
+    if req.user_timezone and req.user_timezone != authoritative_timezone:
+        logger.info(
+            "Ignoring client-supplied user_timezone=%r for user %d; using stored profile "
+            "timezone %r instead",
+            req.user_timezone, user_id, authoritative_timezone,
+        )
+
     # ========== REMINDER CREATION ==========
     try:
-        # Delegate to reminder_service for consistent timezone handling
         result = await reminder_service.maybe_create_from_scheduled_at(
             db=db,
             user_id=user_id,
             content=req.content,
             scheduled_at_local=scheduled_at,
-            user_timezone=req.user_timezone,
+            user_timezone=authoritative_timezone,
         )
-        
-        # Validate result
+
         if not result:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Could not create reminder",
             )
-        
-        # Check for errors from service
+
         if result.get("status") == "error":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=result.get("error", "Unknown error"),
             )
-        
-        # Verify success status
+
         if result.get("status") != "created":
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Unexpected response from service",
             )
-        
-        # Extract reminder from result
+
         reminder = result["reminder"]
-        
+
         logger.info(
             "Reminder created for user %d: id=%d, content='%s', scheduled_at=%s",
             user_id,
             reminder.id,
-            reminder.content,
+            PIIMasker.mask_message(reminder.content),
             reminder.scheduled_at,
         )
-        
+
         return ReminderResponse(
             status="created",
             reminder_id=reminder.id,
             content=reminder.content,
             scheduled_at_local=result["local_time"],
         )
-        
+
     except ValueError as exc:
         logger.warning("Reminder creation validation failed for user %d: %s", user_id, exc)
         raise HTTPException(
@@ -157,7 +175,6 @@ async def create_reminder(
             detail=str(exc),
         )
     except HTTPException:
-        # Re-raise HTTP exceptions as-is
         raise
     except Exception as exc:
         logger.exception("Unexpected error creating reminder for user %d: %s", user_id, exc)

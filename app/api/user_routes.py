@@ -13,24 +13,24 @@ router = APIRouter()
 def get_user_id_from_header(authorization: str = Header(None)) -> int:
     """
     Extract and validate user_id from Authorization header.
-    
+
     Distinguishes between:
     1. No Authorization header → Returns None (optional auth)
     2. Authorization header present but invalid/expired → Raises 401
-    
+
     Args:
         authorization: Authorization header value
-        
+
     Returns:
         user_id if valid, None if no header
-        
+
     Raises:
         HTTPException(401): If header present but invalid/expired
     """
     # Case 1: No authorization header - optional auth allowed
     if not authorization:
         return None
-    
+
     # Case 2: Authorization header present - must be valid
     if not authorization.startswith("Bearer "):
         logger.warning("Invalid authorization header format")
@@ -38,18 +38,18 @@ def get_user_id_from_header(authorization: str = Header(None)) -> int:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authorization header format. Use: Authorization: Bearer <token>"
         )
-    
+
     # Extract token and verify
     token = authorization.replace("Bearer ", "")
     user_id = verify_access_token(token)
-    
+
     if user_id is None:
         logger.warning("Invalid or expired token provided")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token"
         )
-    
+
     return user_id
 
 
@@ -60,21 +60,21 @@ async def get_profile(
 ):
     """
     Get user profile.
-    
+
     Optional authentication - works with or without token.
     If token provided and invalid, returns 401.
-    
+
     Args:
         db: Database session
         user_id: User ID from token (None if not authenticated)
-        
+
     Returns:
         User profile with display_name, language, timezone, account_tier
-        
+
     Raises:
         HTTPException(401): If auth header present but invalid/expired
     """
-    
+
     # If not authenticated, return limited profile or ask to login
     if not user_id:
         return {
@@ -82,19 +82,19 @@ async def get_profile(
             "message": "Please sign in to view your profile",
             "profile": None
         }
-    
+
     try:
         profile = UserRepository.get_or_create_profile(db, user_id)
-        
+
         if not profile:
             logger.warning("Profile not found for user %d", user_id)
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Profile not found"
             )
-        
+
         logger.info("Profile retrieved for user %d", user_id)
-        
+
         return {
             "status": "success",
             "profile": {
@@ -122,22 +122,29 @@ async def update_profile(
 ):
     """
     Update user profile.
-    
+
     Requires authentication (401 if token missing or invalid).
-    
+
+    P0-11 FIX: a "timezone" field in the update payload is now validated
+    against the real IANA tz database (via validate_timezone()) and
+    rejected with 400 if invalid, instead of being stored as-is via a raw
+    setattr. This was one of the two places the review flagged as
+    bypassing timezone validation entirely (the other was the onboarding
+    flow - see onboarding_service.parse_timezone).
+
     Args:
         update_data: Fields to update
         db: Database session
         user_id: User ID from token
-        
+
     Returns:
         Updated profile
-        
+
     Raises:
         HTTPException(401): If not authenticated
         HTTPException(400): If invalid data
     """
-    
+
     # Require authentication for updates
     if not user_id:
         logger.warning("Unauthenticated profile update attempt")
@@ -145,7 +152,7 @@ async def update_profile(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication required to update profile"
         )
-    
+
     try:
         # Validate update data
         if not update_data:
@@ -153,29 +160,41 @@ async def update_profile(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="No fields to update"
             )
-        
+
         # Only allow specific fields to be updated
         allowed_fields = {"display_name", "language", "timezone", "response_style"}
         invalid_fields = set(update_data.keys()) - allowed_fields
-        
+
         if invalid_fields:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Cannot update fields: {', '.join(invalid_fields)}"
             )
-        
+
+        # P0-11 FIX: validate + canonicalize the timezone before it ever
+        # reaches setattr(). An invalid zone is a 400, not a silent store.
+        if "timezone" in update_data and update_data["timezone"] is not None:
+            from app.services.timezone_service import validate_timezone, TimezoneValidationError
+            try:
+                update_data["timezone"] = validate_timezone(update_data["timezone"])
+            except TimezoneValidationError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=str(exc),
+                )
+
         profile = UserRepository.get_or_create_profile(db, user_id)
-        
+
         # Update allowed fields
         for field, value in update_data.items():
             if field in allowed_fields and value is not None:
                 setattr(profile, field, value)
-        
+
         db.commit()
         db.refresh(profile)
-        
+
         logger.info("Profile updated for user %d", user_id)
-        
+
         return {
             "status": "success",
             "profile": {

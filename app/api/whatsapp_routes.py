@@ -1,300 +1,194 @@
-"""WhatsApp Webhook Routes"""
-import hashlib
-import hmac
+
 import json
 import logging
-
-from fastapi import APIRouter, Header, HTTPException, Query, Request, Depends, status
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, Request, HTTPException
 from sqlalchemy.orm import Session
 
-from app.schemas.schemas import PIIMasker 
-from app.core.config import settings
 from app.db.database import get_db
-from app.models.database import Message
-from app.services.chat_service import chat_service
+from app.core.config import settings
+from app.models.database import User
 from app.services.whatsapp_service import whatsapp_service
-from app.repositories.user_repository import UserRepository
+from app.services.chat_service import chat_service
+from app.schemas.schemas import PIIMasker
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
 
 
-def _verify_signature(raw_body: bytes, signature_header: str) -> bool:
+@router.get("/whatsapp")
+def webhook_verify(request: Request):
     """
-    Meta signs every POST webhook body with HMAC-SHA256 using your App
-    Secret, sent as 'sha256=<hex>' in the X-Hub-Signature-256 header.
-    
-    Without this check, anyone who finds your ngrok/production URL can POST
-    fake messages, phone numbers and message IDs and the backend will treat
-    them as real WhatsApp traffic — triggering LLM calls, reminders, and
-    outbound WhatsApp sends on your dime.
-    
-    Returns:
-        True if signature is valid, False otherwise
+    WhatsApp webhook verification (GET).
+
+    P0-9 FIX: now actually compares hub.verify_token to
+    settings.WHATSAPP_VERIFY_TOKEN before echoing hub.challenge back,
+    instead of accepting any request that merely included a challenge.
     """
-    if not signature_header or not signature_header.startswith("sha256="):
-        return False
-    
-    expected = hmac.new(
-        settings.WHATSAPP_APP_SECRET.encode("utf-8"),
-        raw_body,
-        hashlib.sha256,
-    ).hexdigest()
-    
-    provided = signature_header.split("sha256=", 1)[1]
-    
-    # constant-time compare — a plain == leaks timing info an attacker can
-    # use to guess the signature byte by byte.
-    return hmac.compare_digest(expected, provided)
+    verify_token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if not settings.WHATSAPP_VERIFY_TOKEN:
+        logger.error("WHATSAPP_VERIFY_TOKEN is not configured - refusing to verify")
+        raise HTTPException(status_code=403, detail="Webhook verification not configured")
+
+    if challenge and verify_token == settings.WHATSAPP_VERIFY_TOKEN:
+        logger.info("✅ WhatsApp webhook verified")
+        return int(challenge)
+
+    logger.warning("❌ WhatsApp webhook verification failed (missing/incorrect verify_token)")
+    raise HTTPException(status_code=403, detail="Webhook verification failed")
 
 
-def _is_duplicate_message(db: Session, external_message_id: str) -> bool:
+async def _process_message_background(provider_message_id: str, user_id: int, phone: str, text: str):
     """
-    Check if message was already processed.
-    
-    FIXED (Issue #15): Checks external_message_id for idempotency
-    Returns True if message already exists, False if new.
-    
-    Args:
-        db: Database session
-        external_message_id: WhatsApp message ID
-        
-    Returns:
-        True if message already processed, False if new
+    Runs as a FastAPI BackgroundTask, AFTER the webhook has already
+    returned 200 to Meta - see the P0-8 note at the top of this file for
+    what this does and does not guarantee.
+
+    Uses its own DB session (the request's `db` dependency is torn down
+    once the response is sent, so it can't safely be reused here).
+
+    Assumes app/db/database.py exposes a `SessionLocal` sessionmaker
+    alongside `get_db` (the standard FastAPI pattern) - adjust this
+    import if your module names it differently.
     """
-    if not external_message_id:
-        return False
-    
+    from app.db.database import SessionLocal
+
+    db = SessionLocal()
     try:
-        existing = db.query(Message).filter(
-            Message.external_message_id == external_message_id
-        ).first()
-        return existing is not None
-    except Exception as e:
-        logger.warning(f"Error checking for duplicate message: {e}")
-        # On error, assume not duplicate (process it)
-        return False
+        try:
+            await whatsapp_service.mark_as_read(provider_message_id)
+        except Exception as e:
+            logger.warning(f"mark_as_read failed for {provider_message_id}: {e}")
+
+        try:
+            response = await chat_service.process_message(
+                db=db, message=text, user_id=user_id, channel="whatsapp"
+            )
+            ai_response = response.get("response")
+        except Exception as e:
+            logger.exception(f"chat_service failed for {provider_message_id}: {e}")
+            ai_response = "Sorry, there was an error processing your message. Please try again."
+
+        if ai_response:
+            sent = await whatsapp_service.send_message(phone, ai_response)
+            if sent:
+                logger.info(f"✅ Sent AI response to {PIIMasker.mask_phone(phone)}")
+            else:
+                logger.error(f"❌ Failed to send response to {PIIMasker.mask_phone(phone)}")
+        else:
+            logger.error(f"No response generated for {provider_message_id}")
+
+    finally:
+        db.close()
 
 
-@router.post("/webhook/whatsapp")
-async def whatsapp_webhook(
-    request: Request,
-    db: Session = Depends(get_db),
-    x_hub_signature_256: str = Header(None, alias="X-Hub-Signature-256"),
-):
+@router.post("/whatsapp")
+async def webhook(request: Request, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
-    Receive messages from WhatsApp Cloud API.
-    
-    FIXED (Issue #15): Checks external_message_id for duplicates
-    FIXED (Issue #17): Returns appropriate HTTP status codes
-    - 200: Malformed/non-actionable events (can't retry)
-    - 401: Invalid signature
-    - 500: Retryable failures (database, network)
-    - 503: Service temporarily unavailable
-    
-    Args:
-        request: FastAPI request
-        db: Database session
-        x_hub_signature_256: Webhook signature from Meta
-        
-    Returns:
-        Status response
-        
-    Raises:
-        HTTPException(401): Invalid webhook signature
-        HTTPException(500): Retryable server error
+    WhatsApp webhook.
+
+    1. Verify the HMAC signature (P0-9).
+    2. Parse ALL messages (P0-7).
+    3. Persist the event, then persist+dedupe each message id (P0-6,
+       and the P0-8 event-level race fix in whatsapp_service - see
+       persist_webhook_event) - fast, synchronous, durable.
+    4. Return 200 immediately; hand the actual AI processing + reply to
+       a background task (P0-8) so a slow LLM call can't blow Meta's
+       webhook timeout.
     """
     raw_body = await request.body()
 
-    # Validate webhook signature (Issue #17: Return 401 for invalid signature)
-    if not _verify_signature(raw_body, x_hub_signature_256):
-        logger.warning("❌ Rejected WhatsApp webhook: invalid or missing signature")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid webhook signature"
-        )
-
-    # Parse JSON (Issue #17: Return 200 for malformed - can't retry)
-    try:
-        body = json.loads(raw_body)
-    except json.JSONDecodeError:
-        # Not actionable, but also not our fault — 200 so Meta doesn't retry
-        # a payload that will never parse.
-        logger.warning("⚠️  WhatsApp webhook body was not valid JSON")
-        return {"status": "ok", "reason": "malformed_json"}
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    if not whatsapp_service.verify_webhook_signature(raw_body.decode("utf-8"), signature):
+        logger.warning("❌ WhatsApp webhook signature verification failed")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     try:
-        logger.info("📱 WhatsApp webhook received")
+        payload = json.loads(raw_body)
+    except Exception as e:
+        logger.error(f"Failed to parse webhook: {e}")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-        # Parse message (handles malformed data gracefully)
-        parsed_message = whatsapp_service.parse_webhook_message(body)
+    logger.info("📨 WhatsApp webhook received")
 
-        if not parsed_message:
-            logger.debug("ℹ️  No actionable message in webhook (likely a status update)")
-            return {"status": "ok", "reason": "no_actionable_message"}
+    messages = whatsapp_service.parse_all_webhook_messages(payload)
+    if not messages:
+        logger.info("No messages to process")
+        return {"status": "ok", "processed": 0}
 
-        phone_number = parsed_message["phone_number"]
-        message_content = parsed_message["content"]
-        message_id = parsed_message["message_id"]
+    logger.info(f"🔄 Persisting {len(messages)} message(s)")
 
-        # ✅ FIXED Issue #18: Use PIIMasker for safe logging
-        logger.info(
-            "📱 WhatsApp message received",
-            extra={
-                "phone_masked": PIIMasker.mask_phone(phone_number),
-                "message_id": message_id,
-            }
-        )
+    # P0-8 (event race) FIX: persist_webhook_event is now an atomic
+    # get-or-create (see whatsapp_service.py) - no separate
+    # SELECT-before-insert pre-check needed here anymore.
+    provider_event_id = payload.get("entry", [{}])[0].get("id", "unknown")
+    webhook_event_id = await whatsapp_service.persist_webhook_event(db, payload, provider_event_id)
+    if not webhook_event_id:
+        db.rollback()
+        return {"status": "error", "detail": "Failed to persist webhook"}
 
-        # ========== IDEMPOTENCY CHECK (Issue #15) ==========
-        # Check if message already processed to prevent duplicates
-        if _is_duplicate_message(db, message_id):
-            logger.info(f"✓ Message {message_id} already processed (idempotent)")
-            return {
-                "status": "ok",
-                "reason": "duplicate_message",
-                "message_processed": False
-            }
+    queued_count = 0
+    errors = []
 
-        # Mark as read (Issue #13: Now async)
+    for msg in messages:
         try:
-            await whatsapp_service.mark_as_read(message_id)
-        except Exception as e:
-            logger.warning(f"Failed to mark message as read: {e}")
-            # Don't fail the whole webhook for this
+            phone = f"+{msg['from']}"  # Normalize with +
+            text = msg["content"]
+            provider_message_id = msg["provider_message_id"]
 
-        # ========== USER LOOKUP ==========
-        user = UserRepository.get_by_phone(db, phone_number)
+            logger.info(f"📱 Persisting message from {PIIMasker.mask_phone(phone)}")
 
-        if not user:
-            # ✅ FIXED Issue #18: Use PIIMasker for safe logging
-            logger.info(
-                "ℹ️  Message from unlinked WhatsApp number",
-                extra={
-                    "phone_masked": PIIMasker.mask_phone(phone_number),
-                }
-            )
-            try:
-                # Issue #13: Now async
-                await whatsapp_service.send_message(
-                    phone_number,
-                    "Hi! I don't recognize this number yet. Please sign up on the web "
-                    "app first, then add this WhatsApp number during setup to link it.",
+            user = db.query(User).filter(User.phone_number == phone).first()
+
+            if not user:
+                logger.warning(f"❌ User not found for phone: {PIIMasker.mask_phone(phone)}")
+                background_tasks.add_task(
+                    whatsapp_service.send_message,
+                    phone,
+                    "Sorry, we couldn't find your account. Please check your phone number.",
                 )
-            except Exception as e:
-                logger.warning(f"Failed to send onboarding message: {e}")
-            
-            return {
-                "status": "ok",
-                "message_processed": False,
-                "reason": "unlinked_number"
-            }
+                errors.append(f"No user for {PIIMasker.mask_phone(phone)}")
+                continue
 
-        user_id = user.id
-
-        # ========== PROCESS MESSAGE ==========
-        response_data = await chat_service.process_message(
-            db=db,
-            message=message_content,
-            user_id=user_id,
-            channel="whatsapp",
-        )
-
-        ai_response = response_data.get("response", "Sorry, I couldn't process that.")
-
-        # Send response (Issue #13: Now async)
-        success = await whatsapp_service.send_message(phone_number, ai_response)
-
-        if success:
-            # ✅ FIXED Issue #18: Use PIIMasker for safe logging
-            logger.info(
-                "✅ Response sent to WhatsApp",
-                extra={
-                    "user_id": user_id,
-                    "phone_masked": PIIMasker.mask_phone(phone_number),
-                }
-            )
-        else:
-            # ✅ FIXED Issue #18: Use PIIMasker for safe logging
-            logger.error(
-                "❌ Failed to send response to WhatsApp",
-                extra={
-                    "user_id": user_id,
-                    "phone_masked": PIIMasker.mask_phone(phone_number),
-                }
+            # P0-6: idempotency - persist BEFORE any processing
+            persisted = await whatsapp_service.persist_webhook_message(
+                db, webhook_event_id, user.id, provider_message_id
             )
 
-        return {
-            "status": "success",
-            "message_processed": True,
-            "user_id": user_id
-        }
+            if not persisted:
+                logger.info(f"⏭️  Message already processed: {provider_message_id}")
+                continue
 
-    except HTTPException:
-        # Re-raise HTTP exceptions
-        raise
-    except ValueError as e:
-        # Database constraint, validation error (not retryable)
-        logger.warning(f"⚠️  Validation error: {e}")
-        # Return 200 for non-retryable errors (Issue #17)
-        return {
-            "status": "ok",
-            "message_processed": False,
-            "reason": "validation_error"
-        }
-    except Exception as e:
-        # Genuine internal failure (retryable)
-        logger.exception("❌ WhatsApp webhook error (retryable)")
-        # Let Meta know to retry rather than silently swallowing it as 200 (Issue #17)
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Service temporarily unavailable - message will be retried"
-        ) from e
+            # P0-8: hand off the slow part (mark-as-read, chat LLM call,
+            # outbound send) to a background task instead of awaiting it
+            # here before responding to Meta.
+            background_tasks.add_task(
+                _process_message_background, provider_message_id, user.id, phone, text
+            )
+            queued_count += 1
 
+        except Exception as e:
+            logger.exception(f"Error persisting message: {e}")
+            errors.append(str(e))
 
-@router.get("/webhook/whatsapp")
-async def verify_whatsapp_webhook(
-    hub_mode: str = Query(None, alias="hub.mode"),
-    hub_challenge: str = Query(None, alias="hub.challenge"),
-    hub_verify_token: str = Query(None, alias="hub.verify_token"),
-):
-    """
-    Verify WhatsApp webhook with Meta.
-    
-    This endpoint is called by Meta during webhook setup to verify
-    that the webhook URL is valid and belongs to the application.
-    
-    Args:
-        hub_mode: Should be "subscribe"
-        hub_challenge: Echo this back to Meta
-        hub_verify_token: Must match WHATSAPP_VERIFY_TOKEN
-        
-    Returns:
-        Challenge string if valid
-        
-    Raises:
-        HTTPException(403): If verification token doesn't match
-        HTTPException(500): If unexpected error
-    """
     try:
-        logger.info("🔐 WhatsApp webhook verification attempt")
-
-        if hub_mode == "subscribe" and whatsapp_service.verify_webhook(hub_verify_token):
-            logger.info("✅ WhatsApp webhook verified!")
-            return PlainTextResponse(content=hub_challenge)
-        else:
-            logger.warning("❌ WhatsApp webhook verification failed (invalid token)")
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Invalid verification token"
-            )
-    except HTTPException:
-        raise
+        db.commit()
+        logger.info(f"✅ Persisted+queued {queued_count}/{len(messages)} messages")
     except Exception as e:
-        logger.exception("❌ Webhook verification error")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Error verifying webhook"
-        ) from e
+        db.rollback()
+        logger.error(f"Failed to commit: {e}")
+        return {"status": "error", "detail": "Failed to commit changes"}
+
+    return {
+        "status": "ok",
+        "queued": queued_count,
+        "total": len(messages),
+        "errors": errors if errors else None,
+    }
+
+
+@router.get("/whatsapp/health")
+def whatsapp_health():
+    """Health check"""
+    return {"status": "ok", "service": "whatsapp"}

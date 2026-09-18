@@ -1,134 +1,163 @@
-import html
-import logging
-import os
 
-import requests
+import html as html_lib
+import logging
+from typing import Optional
+
+import httpx
 
 from app.core.config import settings
+from app.schemas.schemas import PIIMasker
 
 logger = logging.getLogger(__name__)
 
-TIMEOUT_SECONDS = 15
-BREVO_URL = "https://api.brevo.com/v3/smtp/email"
-SUBJECT_MAX_LEN = 60
-
-
-def _setting(name: str):
-    """settings first, then the raw environment."""
-    value = getattr(settings, name, None)
-    if value in (None, ""):
-        value = os.getenv(name)
-    return value or None
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 
 class EmailService:
+    """Email service for sending reminders and notifications via Brevo's transactional email API."""
+
     def __init__(self):
-        self.api_key = _setting("BREVO_API_KEY")
-        self.sender = _setting("BREVO_SENDER_EMAIL")
-        self.sender_name = _setting("BREVO_SENDER_NAME") or "Your AI Companion"
+        self.sender_email = settings.BREVO_SENDER_EMAIL
+        self.sender_name = settings.BREVO_SENDER_NAME
+        self.api_key = settings.BREVO_API_KEY
 
-        if not self.api_key or not self.sender:
-            logger.error(
-                "Brevo is not configured (api_key=%s, sender=%s); reminders cannot be sent",
-                bool(self.api_key), self.sender,
-            )
-        else:
-            logger.info("Email mode: Brevo | from %s", self.sender)
-
-    def send_reminder(self, user_email: str, content: str, user_name: str | None = None) -> bool:
-        """True only if Brevo accepted the message. Never guess.
-
-        FIXED (Issue #42: Reminder emails looked like a bare content dump
-        instead of a real notification): subject now reflects the actual
-        reminder instead of a static "Reminder", and the body reads as a
-        short, warm note rather than a label + raw string.
-
-        Args:
-            user_email: Recipient's email address
-            content: The short imperative reminder text (e.g. "Go for a walk")
-            user_name: Optional display name for a personalised greeting
+    async def _send_via_brevo(
+        self,
+        to_email: str,
+        to_name: Optional[str],
+        subject: str,
+        html_content: str,
+        text_content: str,
+    ) -> bool:
         """
-        if not self.api_key or not self.sender:
-            logger.error("Brevo is not configured; cannot send to %s", user_email)
+        The actual API call - both send_reminder() and send_notification()
+        below route through this single place, so there's one spot that
+        owns auth, the request shape, and error logging.
+        """
+        if not self.api_key:
+            logger.error("BREVO_API_KEY is not configured - cannot send email")
             return False
 
-        content = (content or "").strip()
-        safe = html.escape(content)
-        first_name = (user_name or "").strip().split(" ")[0] if user_name else ""
-        greeting = f"Hi {html.escape(first_name)}," if first_name else "Hi there,"
-        subject = self._subject_for(content)
+        if not self.sender_email:
+            logger.error("BREVO_SENDER_EMAIL is not configured - cannot send email")
+            return False
 
-        text_content = (
-            f"{('Hi ' + first_name) if first_name else 'Hi there'},\n\n"
-            f"Just a friendly reminder: {content}\n\n"
-            f"— {self.sender_name}"
-        )
-
-        html_content = (
-            "<div style=\"font-family:system-ui,Segoe UI,Arial,sans-serif;"
-            "font-size:16px;line-height:1.6;color:#111;max-width:480px;margin:0 auto\">"
-            f"<p style=\"margin:0 0 14px\">{greeting}</p>"
-            "<p style=\"margin:0 0 16px\">Just a friendly reminder to:</p>"
-            "<p style=\"margin:0 0 22px;padding:12px 16px;background:#f4f6f8;"
-            "border-left:4px solid #4f46e5;border-radius:6px;font-weight:600\">"
-            f"{safe}</p>"
-            f"<p style=\"margin:0;color:#666;font-size:14px\">— {html.escape(self.sender_name)} 💙</p>"
-            "</div>"
-        )
+        recipient: dict = {"email": to_email}
+        if to_name:
+            recipient["name"] = to_name
 
         payload = {
-            "sender": {"email": self.sender, "name": self.sender_name},
-            "to": [{"email": user_email}],
+            "sender": {"name": self.sender_name, "email": self.sender_email},
+            "to": [recipient],
             "subject": subject,
-            "textContent": text_content,
             "htmlContent": html_content,
+            "textContent": text_content,
         }
         headers = {
+            "accept": "application/json",
             "api-key": self.api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
+            "content-type": "application/json",
         }
 
         try:
-            response = requests.post(
-                BREVO_URL, json=payload, headers=headers, timeout=TIMEOUT_SECONDS
-            )
-        except requests.RequestException as exc:
-            logger.error("Email transport error for %s: %s", user_email, exc)
-            return False
+            async with httpx.AsyncClient(timeout=30) as client:
+                response = await client.post(BREVO_API_URL, json=payload, headers=headers)
 
-        if response.status_code == 401:
+            if response.status_code in (200, 201):
+                message_id = None
+                try:
+                    message_id = response.json().get("messageId")
+                except Exception:
+                    pass
+                logger.info(
+                    "✅ Email sent via Brevo",
+                    extra={
+                        "email_masked": PIIMasker.mask_email(to_email),
+                        "message_id": message_id,
+                    },
+                )
+                return True
+
+            # This is the log line the old stub could never produce,
+            # because it never made a real call that could fail. If
+            # something's wrong on Brevo's side (unverified sender,
+            # blocked domain, bad template, rate limit), the actual
+            # reason shows up here now.
             logger.error(
-                "Brevo 401 Unauthorized: check API key. Body: %s", response.text[:300]
+                "❌ Brevo send failed",
+                extra={
+                    "email_masked": PIIMasker.mask_email(to_email),
+                    "status_code": response.status_code,
+                    "response_body": response.text[:500],
+                },
             )
             return False
 
-        if response.status_code == 400:
-            logger.error(
-                "Brevo 400 Bad Request for %s — likely sender email %s is not "
-                "verified yet. Body: %s",
-                user_email, self.sender, response.text[:400],
-            )
+        except Exception as e:
+            logger.error(f"❌ Brevo API call failed: {e}")
             return False
 
-        if not (200 <= response.status_code < 300):
-            logger.error(
-                "Brevo rejected the send to %s (%s): %s",
-                user_email, response.status_code, response.text[:500],
-            )
+    async def send_reminder(
+        self,
+        user_email: str,
+        content: str,
+        user_name: Optional[str] = None,
+    ) -> bool:
+        """
+        Send reminder email.
+
+        Args:
+            user_email: Recipient email
+            content: Reminder content
+            user_name: Optional user name for personalization
+
+        Returns:
+            True if Brevo accepted the send, False otherwise
+        """
+        if not user_email:
+            logger.warning("No email address provided")
             return False
 
-        logger.info("Reminder email accepted for %s", user_email)
-        return True
+        greeting = user_name or "there"
+        # content is user-supplied (the reminder text itself) - escape
+        # it before embedding in HTML so it can't break the email's
+        # markup or inject anything into the rendered message.
+        safe_content = html_lib.escape(content or "")
+        safe_greeting = html_lib.escape(greeting)
 
-    @staticmethod
-    def _subject_for(content: str) -> str:
-        text = (content or "").strip()
-        if not text:
-            return "⏰ Reminder"
-        if len(text) > SUBJECT_MAX_LEN:
-            text = text[: SUBJECT_MAX_LEN - 1].rstrip() + "…"
-        return f"⏰ Reminder: {text}"
+        subject = "⏰ Your Reminder"
+        html_content = (
+            "<html><body>"
+            f"<p>Hello {safe_greeting},</p>"
+            "<p>You have a reminder:</p>"
+            f"<p><strong>{safe_content}</strong></p>"
+            "<p>---<br>AI Companion</p>"
+            "</body></html>"
+        )
+        text_content = (
+            f"Hello {greeting},\n\n"
+            f"You have a reminder:\n\n{content}\n\n"
+            "---\nAI Companion"
+        )
+
+        return await self._send_via_brevo(user_email, user_name, subject, html_content, text_content)
+
+    async def send_notification(
+        self,
+        user_email: str,
+        subject: str,
+        message: str,
+    ) -> bool:
+        """Send general notification email"""
+        if not user_email:
+            logger.warning("No email address provided")
+            return False
+
+        safe_message = html_lib.escape(message or "")
+        html_content = f"<html><body><p>{safe_message}</p></body></html>"
+
+        return await self._send_via_brevo(user_email, None, subject, html_content, message)
 
 
+# Global instance
 email_service = EmailService()

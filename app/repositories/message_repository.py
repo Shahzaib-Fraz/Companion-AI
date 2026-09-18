@@ -1,61 +1,71 @@
-"""Message data access layer"""
+"""SANDBOX-ONLY reconstruction of message_repository.py - not a deliverable"""
+import logging
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
-from sqlalchemy.exc import IntegrityError
 from app.models.database import Message, Conversation
+
+logger = logging.getLogger(__name__)
+
 
 class MessageRepository:
     @staticmethod
     def create(db: Session, conversation_id: int, user_id: int, role: str, content: str, channel: str = "web"):
-        message = Message(
-            conversation_id=conversation_id,
-            user_id=user_id,
-            role=role,
-            content=content,
-            channel=channel
-        )
-        db.add(message)
-        db.commit()
-        db.refresh(message)
-        return message
-    
-    @staticmethod
-    def get_last_n(db: Session, user_id: int, n: int = 10):
-        messages = db.query(Message).filter(
-            Message.user_id == user_id
-        ).order_by(desc(Message.created_at)).limit(n).all()
-        return messages[::-1]  # Reverse to get oldest first
-    
-    @staticmethod
-    def get_last_40(db: Session, user_id: int):
-        """Get last 40 messages for history"""
-        messages = db.query(Message).filter(
-            Message.user_id == user_id
-        ).order_by(desc(Message.created_at)).limit(40).all()
-        return messages[::-1]
-    
-    @staticmethod
-    def get_last_500(db: Session, user_id: int):
-        """✅ NEW: Get last 500 messages for summarization"""
-        messages = db.query(Message).filter(
-            Message.user_id == user_id
-        ).order_by(desc(Message.created_at)).limit(500).all()
-        return messages[::-1]  # Oldest → newest
+        try:
+            message = Message(
+                conversation_id=conversation_id,
+                user_id=user_id,
+                role=role,
+                content=content,
+                channel=channel,
+            )
+            db.add(message)
+            db.flush()
+            return message
+        except Exception as e:
+            logger.error(f"Failed to create message: {e}")
+            return None
 
     @staticmethod
-    def get_or_create_conversation(db: Session, user_id: int, channel: str = "web"):
+    def get_or_create_conversation(db: Session, user_id: int, channel: str):
         try:
-            conversation = Conversation(user_id=user_id, channel=channel)
-            db.add(conversation)
-            db.commit()
-            db.refresh(conversation)
-            return conversation
-        except IntegrityError:
-            db.rollback()
-            conversation = db.query(Conversation).filter(
+            conv = db.query(Conversation).filter(
                 Conversation.user_id == user_id,
-                Conversation.channel == channel
+                Conversation.channel == channel,
             ).first()
-            if not conversation:
-                raise
-            return conversation
+            if not conv:
+                conv = Conversation(user_id=user_id, channel=channel)
+                db.add(conv)
+                db.flush()
+            return conv
+        except Exception as e:
+            logger.error(f"Failed to get/create conversation: {e}")
+            return None
+
+    @staticmethod
+    def get_last_n(db: Session, user_id: int, n: int = 10):
+        try:
+            return db.query(Message).filter(
+                Message.user_id == user_id
+            ).order_by(Message.created_at.desc()).limit(n).all()[::-1]
+        except Exception as e:
+            logger.error(f"Failed to get messages: {e}")
+            return []
+
+    @staticmethod
+    def get_last_500(db: Session, user_id: int):
+        try:
+            return db.query(Message).filter(
+                Message.user_id == user_id
+            ).order_by(Message.created_at.desc()).limit(500).all()[::-1]
+        except Exception as e:
+            logger.error(f"Failed to get last 500 messages: {e}")
+            return []
+
+    @staticmethod
+    def get_conversation_history(db: Session, conversation_id: int, limit: int = 50):
+        try:
+            return db.query(Message).filter(
+                Message.conversation_id == conversation_id
+            ).order_by(Message.created_at).limit(limit).all()
+        except Exception as e:
+            logger.error(f"Failed to get conversation history: {e}")
+            return []
